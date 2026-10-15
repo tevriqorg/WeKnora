@@ -93,6 +93,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/limiter" // register built-in vendors
 	"github.com/Tencent/WeKnora/internal/models/utils/ollama"
 	"github.com/Tencent/WeKnora/internal/router"
+	appRuntime "github.com/Tencent/WeKnora/internal/runtime"
 	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/Tencent/WeKnora/internal/storageallowlist"
 	"github.com/Tencent/WeKnora/internal/stream"
@@ -115,6 +116,8 @@ import (
 // Returns:
 //   - Configured container with all application dependencies registered
 func BuildContainer(container *dig.Container) *dig.Container {
+	runtimeCfg := appRuntime.MustRuntimeConfigFromEnv()
+
 	// Deployment-level model catalog overlay (config/models.json, optional).
 	// Register providers explicitly, then validate and publish one catalog generation.
 	if err := modelruntime.Initialize(config.ConfigDir()); err != nil {
@@ -440,6 +443,9 @@ func BuildContainer(container *dig.Container) *dig.Container {
 
 	logger.Debugf(ctx, "[Container] Registering task enqueuer...")
 	redisAvailable := os.Getenv("REDIS_ADDR") != ""
+	if runtimeCfg.RequiresRedis() && !redisAvailable {
+		panic(fmt.Sprintf("runtime role %s requires REDIS_ADDR", runtimeCfg.Role))
+	}
 	if redisAvailable {
 		must(container.Provide(router.NewAsyncqClient, dig.As(new(interfaces.TaskEnqueuer))))
 		// Dedicated pools guarantee capacity for each stage. The shared pool
@@ -472,7 +478,9 @@ func BuildContainer(container *dig.Container) *dig.Container {
 		must(container.Invoke(registerLiteModelConcurrencyLimiter))
 	}
 	must(container.Provide(service.NewTemporaryDocumentService))
-	must(container.Invoke(startTemporaryDocumentCleanup))
+	if runtimeCfg.RunsCoordinator() {
+		must(container.Invoke(startTemporaryDocumentCleanup))
+	}
 
 	// Chat pipeline components for processing chat requests
 	logger.Debugf(ctx, "[Container] Registering chat pipeline plugins...")
@@ -482,13 +490,17 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(initConnectorRegistry))
 	must(container.Provide(datasource.NewScheduler))
 	must(container.Provide(service.NewDataSourceService))
-	must(container.Invoke(startDataSourceScheduler))
-	logger.Debugf(ctx, "[Container] Data source sync framework registered")
-	must(container.Invoke(startAuditLogRetention))
-	logger.Debugf(ctx, "[Container] Audit log retention runner registered")
+	if runtimeCfg.RunsCoordinator() {
+		must(container.Invoke(startDataSourceScheduler))
+		logger.Debugf(ctx, "[Container] Data source sync framework registered")
+		must(container.Invoke(startAuditLogRetention))
+		logger.Debugf(ctx, "[Container] Audit log retention runner registered")
+	}
 	must(container.Provide(service.NewHousekeepingService))
-	must(container.Invoke(startHousekeepingService))
-	logger.Debugf(ctx, "[Container] Knowledge housekeeping runner registered")
+	if runtimeCfg.RunsCoordinator() {
+		must(container.Invoke(startHousekeepingService))
+		logger.Debugf(ctx, "[Container] Knowledge housekeeping runner registered")
+	}
 	must(container.Provide(chatpipeline.NewEventManager))
 	must(container.Invoke(chatpipeline.NewPluginSearch))
 	must(container.Invoke(chatpipeline.NewPluginRerank))
@@ -513,8 +525,10 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	// it), but Invoke constructs the whole chain. SessionService needs
 	// *chatpipeline.EventManager, which only exists after the pipeline
 	// block above — starting the reaper any earlier panics.
-	must(container.Invoke(startTenantSkillReaper))
-	logger.Debugf(ctx, "[Container] Tenant skill reaper registered")
+	if runtimeCfg.RunsCoordinator() {
+		must(container.Invoke(startTenantSkillReaper))
+		logger.Debugf(ctx, "[Container] Tenant skill reaper registered")
+	}
 	must(container.Provide(func(
 		sessions interfaces.SessionRepository,
 		resolver sandbox.TenantSandboxResolver,
@@ -524,8 +538,10 @@ func BuildContainer(container *dig.Container) *dig.Container {
 			sessions, service.NewResolverForkSnapshotDeleter(resolver, mgr),
 		)
 	}))
-	must(container.Invoke(startForkSnapshotReaper))
-	logger.Debugf(ctx, "[Container] Fork snapshot reaper registered")
+	if runtimeCfg.RunsCoordinator() {
+		must(container.Invoke(startForkSnapshotReaper))
+		logger.Debugf(ctx, "[Container] Fork snapshot reaper registered")
+	}
 
 	// HTTP handlers layer
 	logger.Debugf(ctx, "[Container] Registering HTTP handlers...")
@@ -590,7 +606,9 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	// IM integration
 	logger.Debugf(ctx, "[Container] Registering IM integration...")
 	must(container.Provide(imPkg.NewService))
-	must(container.Invoke(registerIMService))
+	if runtimeCfg.RunsCoordinator() {
+		must(container.Invoke(registerIMService))
+	}
 	must(container.Provide(handler.NewIMHandler))
 	must(container.Provide(handler.NewEmbedChannelHandler))
 	must(container.Provide(handler.NewMCPEndpointHandler))
@@ -606,7 +624,9 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	logger.Debugf(ctx, "[Container] Registering router and starting task server...")
 	must(container.Provide(router.NewRouter))
 	if redisAvailable {
-		must(container.Invoke(router.RunAsynqServer))
+		if runtimeCfg.RunsWorkers() {
+			must(container.Invoke(router.RunAsynqServer))
+		}
 	} else {
 		must(container.Invoke(router.RegisterSyncHandlers))
 	}
@@ -614,15 +634,19 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	// lost across a process restart (always in Lite mode, and in Redis mode if
 	// persistence succeeded immediately before trigger enqueue failed). Re-arm
 	// them only after the matching handlers are ready.
-	must(container.Invoke(recoverPendingWikiTasks))
+	if runtimeCfg.RunsCoordinator() {
+		must(container.Invoke(recoverPendingWikiTasks))
+	}
 
 	// BrowserSkill is registered when its manager is constructed, which is
 	// early, so reverse-order cleanup would run it last. Force the manager
 	// to exist, then run that hook first so a slow cron stop cannot leave
 	// the daemon alive until the process is killed.
-	must(container.Invoke(func(cleaner interfaces.ResourceCleaner, _ *browserskill.Manager) {
-		cleaner.Promote("BrowserSkill")
-	}))
+	if runtimeCfg.RunsCoordinator() {
+		must(container.Invoke(func(cleaner interfaces.ResourceCleaner, _ *browserskill.Manager) {
+			cleaner.Promote("BrowserSkill")
+		}))
+	}
 
 	logger.Infof(ctx, "[Container] Container initialization completed successfully")
 	return container
