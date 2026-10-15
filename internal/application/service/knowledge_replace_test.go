@@ -444,3 +444,31 @@ func TestUpdateKnowledgeUnlessSourceReplacedSkipsStaleSave(t *testing.T) {
 	assert.Equal(t, "new/file.md", h.repo.row.FilePath)
 	assert.NotEqual(t, types.ParseStatusFailed, h.repo.row.ParseStatus)
 }
+
+type g1ExternalReplaceCatalog struct {
+	interfaces.ResourceCatalog
+	released []string
+}
+
+func (c *g1ExternalReplaceCatalog) Release(
+	_ context.Context, ref, _, _ string,
+) (int64, error) {
+	c.released = append(c.released, ref)
+	return 1, nil
+}
+
+func TestG1ReplaceKnowledgeFileNeverDeletesExternalOldSource(t *testing.T) {
+	h := newReplaceFileHarness(t)
+	externalRef := "resource://AbCdEfGhIjKlMnOpQrStUv"
+	h.original.FilePath = externalRef
+	h.repo.row.FilePath = externalRef
+	catalog := &g1ExternalReplaceCatalog{}
+	h.svc.resourceCatalog = catalog
+
+	got, err := h.replace(t, "# replacement", "notes/a.md", nil)
+	require.NoError(t, err)
+	require.Equal(t, h.original.ID, got.ID)
+	require.Equal(t, []string{externalRef}, catalog.released)
+	require.NotContains(t, h.store.deleted, externalRef,
+		"replacing external source must release binding without deleting authoritative bytes")
+}

@@ -284,6 +284,7 @@ type deletionLookupKnowledgeRepo struct {
 	lookupErr         error
 	metadataUpdates   []map[string]string // metadata persisted via UpdateKnowledge / UpdateKnowledgeColumn
 	metadataUpdateErr error
+	columnUpdates     []map[string]interface{}
 	hardDeleted       []string
 	hardDeleteErr     error
 	tenantID          uint64
@@ -303,6 +304,16 @@ func (r *deletionLookupKnowledgeRepo) UpdateKnowledge(_ context.Context, knowled
 		}
 	}
 	r.metadataUpdates = append(r.metadataUpdates, metadata)
+	return nil
+}
+
+func (r *deletionLookupKnowledgeRepo) UpdateKnowledgeColumns(
+	_ context.Context, _ string, updates map[string]interface{},
+) error {
+	if r.metadataUpdateErr != nil {
+		return r.metadataUpdateErr
+	}
+	r.columnUpdates = append(r.columnUpdates, updates)
 	return nil
 }
 

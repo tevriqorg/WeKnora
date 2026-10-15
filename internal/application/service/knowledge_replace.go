@@ -200,7 +200,10 @@ func (s *knowledgeService) ReplaceKnowledgeFile(ctx context.Context,
 
 	if existing.FilePath != newPath {
 		oldFileSvc := s.resolveFileServiceForPath(cleanupCtx, kb, existing.FilePath)
-		if err := oldFileSvc.DeleteFile(cleanupCtx, existing.FilePath); err != nil {
+		releaser := knowledgeResourceOwners(s.resourceCatalog, existing.ID)
+		if !releaser.deletable(cleanupCtx, existing.FilePath) {
+			logger.Infof(cleanupCtx, "Keeping replaced source %s: external or another owner may still reference it", existing.FilePath)
+		} else if err := oldFileSvc.DeleteFile(cleanupCtx, existing.FilePath); err != nil {
 			logger.Warnf(ctx, "Failed to delete replaced file %s of knowledge %s: %v",
 				existing.FilePath, existing.ID, err)
 		}
@@ -254,4 +257,99 @@ func mergeKnowledgeMetadata(current types.JSON, updates map[string]string) (type
 		return nil, err
 	}
 	return types.JSON(b), nil
+}
+
+// ReplaceKnowledgeURL swaps a URL/file-URL source in place while preserving the
+// Knowledge ID and all relations keyed on it. It mirrors ReplaceKnowledgeFile's
+// rollback discipline but has no owned object-storage blob to delete.
+func (s *knowledgeService) ReplaceKnowledgeURL(
+	ctx context.Context,
+	knowledgeID string,
+	rawURL string,
+	fileName string,
+	title string,
+	metadata map[string]string,
+) (*types.Knowledge, error) {
+	existing, kb, err := loadKnowledgeWrite(ctx, s.repo, s.kbService, knowledgeID)
+	if err != nil {
+		return nil, err
+	}
+	if existing.Type != "url" && existing.Type != "file_url" {
+		return nil, werrors.NewBadRequestError("only URL knowledge can have its URL replaced")
+	}
+	if existing.ParseStatus == types.ParseStatusDeleting {
+		return nil, werrors.NewBadRequestError("knowledge is being deleted")
+	}
+	if !isValidURL(rawURL) || !secutils.IsValidURL(rawURL) {
+		return nil, ErrInvalidURL
+	}
+	if err := secutils.ValidateURLForSSRF(rawURL); err != nil {
+		return nil, ErrInvalidURL
+	}
+
+	nextType := "url"
+	nextFileName := ""
+	nextFileType := "html"
+	if isFileURL(rawURL, fileName, "") {
+		nextType = "file_url"
+		if fileName == "" {
+			fileName = extractFileNameFromURL(rawURL)
+		}
+		if fileName != "" {
+			safe, ok := secutils.ValidateInput(fileName)
+			if !ok {
+				return nil, werrors.NewValidationError("文件名包含非法字符")
+			}
+			nextFileName = safe
+		}
+		if nextFileName == "" {
+			nextFileName = existing.FileName
+		}
+		nextFileType = normalizeFileExtension(getFileType(nextFileName))
+		if _, err := resolveFileImportProcessConfig(ctx, kb, nextFileType, nil, nil); err != nil {
+			return nil, err
+		}
+	}
+
+	newMetadata, err := mergeKnowledgeMetadata(existing.Metadata, metadata)
+	if err != nil {
+		return nil, err
+	}
+	newTitle := strings.TrimSpace(title)
+	if newTitle == "" {
+		newTitle = existing.Title
+	}
+	if newTitle == "" && nextFileName != "" {
+		newTitle = nextFileName
+	}
+
+	previous := map[string]interface{}{
+		"type": existing.Type, "title": existing.Title, "source": existing.Source,
+		"file_name": existing.FileName, "file_type": existing.FileType, "file_hash": existing.FileHash,
+		"metadata": existing.Metadata, "parse_status": existing.ParseStatus,
+		"enable_status": existing.EnableStatus, "error_message": existing.ErrorMessage,
+		"updated_at": existing.UpdatedAt,
+	}
+	updates := map[string]interface{}{
+		"type": nextType, "title": newTitle, "source": rawURL,
+		"file_name": nextFileName, "file_type": nextFileType, "file_hash": calculateStr(rawURL),
+		"metadata": newMetadata, "parse_status": types.ParseStatusPending,
+		"enable_status": "disabled", "error_message": "", "updated_at": time.Now(),
+	}
+	if err := s.repo.UpdateKnowledgeColumns(ctx, existing.ID, updates); err != nil {
+		return nil, err
+	}
+
+	reparsed, err := s.reparseKnowledge(ctx, existing.ID, nil, false)
+	if err != nil {
+		cleanupCtx := context.WithoutCancel(ctx)
+		previous["parse_status"] = types.ParseStatusFailed
+		previous["error_message"] = "URL replacement failed; reparse to rebuild the index"
+		previous["updated_at"] = time.Now()
+		if restoreErr := s.repo.UpdateKnowledgeColumns(cleanupCtx, existing.ID, previous); restoreErr != nil {
+			logger.Errorf(ctx, "Failed to restore URL source of knowledge %s: %v", existing.ID, restoreErr)
+		}
+		return nil, err
+	}
+	return reparsed, nil
 }

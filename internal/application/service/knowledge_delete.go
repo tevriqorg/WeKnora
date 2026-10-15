@@ -623,6 +623,11 @@ func (s *knowledgeService) executeKnowledgeDelete(plan *knowledgeDeletePlan, sin
 	for _, knowledge := range knowledgeList {
 		if knowledge.FilePath != "" {
 			fSvc := kbFileServices[knowledge.KnowledgeBaseID]
+			releaser := knowledgeResourceOwners(s.resourceCatalog, knowledge.ID)
+			if !releaser.deletable(ctx, knowledge.FilePath) {
+				logger.Infof(ctx, "Keeping source file %s: external or another owner may still reference it", knowledge.FilePath)
+				continue
+			}
 			if err := fSvc.DeleteFile(ctx, knowledge.FilePath); err != nil {
 				logger.GetLogger(ctx).WithField("error", err).Errorf("DeleteKnowledge delete file failed")
 			}
