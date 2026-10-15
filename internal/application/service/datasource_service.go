@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1279,8 +1281,19 @@ func (s *DataSourceService) validateDataSourceConfig(ctx context.Context, ds *ty
 	return connector.Validate(ctx, config)
 }
 
+type stableDataSourceKnowledgeReplacer interface {
+	ReplaceKnowledgeFile(context.Context, string, *multipart.FileHeader, string, map[string]string) (*types.Knowledge, error)
+	ReplaceKnowledgeURL(context.Context, string, string, string, string, map[string]string) (*types.Knowledge, error)
+}
+
+type sourceRevisionStore interface {
+	UpsertSourceRevision(context.Context, *types.SourceRevision) (*types.SourceRevision, bool, error)
+	RollbackSourceRevision(context.Context, string, string) error
+}
+
 // ingestItem writes a single FetchedItem into the knowledge base.
-// If a knowledge item with the same external_id already exists, it is deleted first (update = delete + re-create).
+// Existing (datasource_id, external_id) nodes are updated in place so their
+// Knowledge identity, tags, references and downstream provenance stay stable.
 //
 // Routing logic:
 //   - Has Content bytes → CreateKnowledgeFromFile (走完整的文档解析 pipeline)
@@ -1318,28 +1331,70 @@ func (s *DataSourceService) ingestItem(ctx context.Context, ds *types.DataSource
 		metadata[k] = v
 	}
 
-	// Check if a knowledge item with this external_id already exists → delete it first (update)
+	// Resolve stable identity once. Updates never delete/re-create the Knowledge.
 	isUpdate := false
+	var existing *types.Knowledge
+	repo := s.knowledgeService.GetRepository()
 	if item.ExternalID != "" {
-		repo := s.knowledgeService.GetRepository()
-		// Scope the lookup to items owned by this data source so identical
-		// external IDs from two data sources cannot collide or overwrite each
-		// other during updates.
-		existing, err := repo.FindByDataSourceExternalID(ctx, ds.TenantID, ds.KnowledgeBaseID, ds.ID, item.ExternalID)
-		if err != nil {
-			logger.Warnf(ctx, "failed to check existing knowledge for external_id=%s: %v", item.ExternalID, err)
-			// Non-fatal: proceed with creation (may produce duplicate)
-		} else if existing != nil {
-			logger.Infof(ctx, "found existing knowledge %s for external_id=%s, deleting for update", existing.ID, item.ExternalID)
-			if err := s.knowledgeService.DeleteKnowledge(ctx, existing.ID); err != nil {
-				logger.Warnf(ctx, "failed to delete existing knowledge %s: %v", existing.ID, err)
-			} else {
-				if herr := repo.HardDeleteKnowledge(ctx, ds.TenantID, existing.ID); herr != nil {
-					logger.Warnf(ctx, "failed to hard-delete replaced knowledge %s: %v", existing.ID, herr)
-				}
-				isUpdate = true
+		var lookupErr error
+		existing, lookupErr = repo.FindByDataSourceExternalID(
+			ctx, ds.TenantID, ds.KnowledgeBaseID, ds.ID, item.ExternalID,
+		)
+		if lookupErr != nil {
+			return false, fmt.Errorf("lookup stable datasource knowledge: %w", lookupErr)
+		}
+		isUpdate = existing != nil
+	}
+
+	if existing != nil {
+		changed := dataSourceItemChanged(existing, item)
+		revision, revisionCreated, revErr := s.recordDataSourceRevision(ctx, existing, item, metadata, "")
+		if revErr != nil {
+			return true, fmt.Errorf("record source revision: %w", revErr)
+		}
+		if !changed {
+			if err := refreshUnchangedDataSourceKnowledge(ctx, repo, existing, item, metadata); err != nil {
+				return true, err
+			}
+			s.sweepStaleSubtree(ctx, ds, item)
+			return true, nil
+		}
+
+		replacer, ok := s.knowledgeService.(stableDataSourceKnowledgeReplacer)
+		if !ok {
+			if revisionCreated {
+				s.rollbackDataSourceRevision(ctx, repo, existing.ID, revision)
+			}
+			return true, fmt.Errorf("knowledge service does not support stable datasource replacement")
+		}
+
+		var replaced *types.Knowledge
+		var replaceErr error
+		if len(item.Content) > 0 {
+			fh, err := bytesToFileHeader(item.Content, item.FileName)
+			if err != nil {
+				s.rollbackDataSourceRevision(ctx, repo, existing.ID, revision)
+				return true, fmt.Errorf("build file header: %w", err)
+			}
+			replaced, replaceErr = replacer.ReplaceKnowledgeFile(ctx, existing.ID, fh, item.FileName, metadata)
+		} else if item.URL != "" {
+			replaced, replaceErr = replacer.ReplaceKnowledgeURL(ctx, existing.ID, item.URL, item.FileName, item.Title, metadata)
+		} else {
+			replaceErr = fmt.Errorf("item has neither content nor URL")
+		}
+		if replaceErr != nil {
+			if revisionCreated {
+				s.rollbackDataSourceRevision(ctx, repo, existing.ID, revision)
+			}
+			return true, replaceErr
+		}
+		if replaced != nil {
+			if _, _, err := s.recordDataSourceRevision(ctx, replaced, item, metadata, replaced.FilePath); err != nil {
+				return true, fmt.Errorf("refresh source revision locator: %w", err)
 			}
 		}
+		s.sweepStaleSubtree(ctx, ds, item)
+		return true, nil
 	}
 
 	// Case 1: content already fetched → build a FileHeader from bytes and call CreateKnowledgeFromFile
@@ -1348,7 +1403,7 @@ func (s *DataSourceService) ingestItem(ctx context.Context, ds *types.DataSource
 		if err != nil {
 			return isUpdate, fmt.Errorf("build file header: %w", err)
 		}
-		if _, err := s.knowledgeService.CreateKnowledgeFromFile(
+		created, err := s.knowledgeService.CreateKnowledgeFromFile(
 			ctx,
 			ds.KnowledgeBaseID,
 			fh,
@@ -1358,7 +1413,8 @@ func (s *DataSourceService) ingestItem(ctx context.Context, ds *types.DataSource
 			tagIDs,        // auto-tag from data source
 			channel,
 			nil,
-		); err != nil {
+		)
+		if err != nil {
 			var dupErr *types.DuplicateKnowledgeError
 			if errors.As(err, &dupErr) && dupIsSameNode(dupErr, item) {
 				// Identical content is already present in the KB under THIS node's
@@ -1367,6 +1423,11 @@ func (s *DataSourceService) ingestItem(ctx context.Context, ds *types.DataSource
 				s.sweepStaleSubtree(ctx, ds, item)
 			}
 			return isUpdate, err
+		}
+		if created != nil {
+			if _, _, revErr := s.recordDataSourceRevision(ctx, created, item, metadata, created.FilePath); revErr != nil {
+				return isUpdate, fmt.Errorf("record initial source revision: %w", revErr)
+			}
 		}
 		s.sweepStaleSubtree(ctx, ds, item)
 		return isUpdate, nil
@@ -1414,12 +1475,111 @@ func (s *DataSourceService) ingestItem(ctx context.Context, ds *types.DataSource
 			); uErr != nil {
 				return isUpdate, fmt.Errorf("attach datasource metadata: %w", uErr)
 			}
+			if _, _, revErr := s.recordDataSourceRevision(ctx, created, item, metadata, created.FilePath); revErr != nil {
+				return isUpdate, fmt.Errorf("record initial source revision: %w", revErr)
+			}
 		}
 		s.sweepStaleSubtree(ctx, ds, item)
 		return isUpdate, nil
 	}
 
 	return isUpdate, fmt.Errorf("item has neither content nor URL")
+}
+
+func dataSourceContentHash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func dataSourceItemChanged(existing *types.Knowledge, item *types.FetchedItem) bool {
+	if existing == nil || item == nil {
+		return true
+	}
+	if len(item.Content) > 0 {
+		return dataSourceContentHash(item.Content) != existing.FileHash
+	}
+	if item.URL != "" {
+		if strings.TrimSpace(item.URL) != strings.TrimSpace(existing.Source) {
+			return true
+		}
+		meta := existing.GetMetadata()
+		for _, key := range []string{"native_version", "etag"} {
+			if value := strings.TrimSpace(item.Metadata[key]); value != "" && value != meta[key] {
+				return true
+			}
+		}
+		if !item.UpdatedAt.IsZero() && item.UpdatedAt.UTC().Format(time.RFC3339) != meta["source_updated_at"] {
+			return true
+		}
+		return false
+	}
+	return true
+}
+
+func refreshUnchangedDataSourceKnowledge(
+	ctx context.Context, repo interfaces.KnowledgeRepository, existing *types.Knowledge,
+	item *types.FetchedItem, metadata map[string]string,
+) error {
+	merged, err := mergeKnowledgeMetadata(existing.Metadata, metadata)
+	if err != nil {
+		return err
+	}
+	updates := map[string]interface{}{"metadata": merged, "updated_at": time.Now()}
+	if item.FileName != "" && item.FileName != existing.FileName {
+		updates["file_name"] = item.FileName
+		if existing.Title == existing.FileName {
+			updates["title"] = item.FileName
+		}
+	}
+	if err := repo.UpdateKnowledgeColumns(ctx, existing.ID, updates); err != nil {
+		return fmt.Errorf("refresh unchanged datasource metadata: %w", err)
+	}
+	return nil
+}
+
+func (s *DataSourceService) recordDataSourceRevision(
+	ctx context.Context, knowledge *types.Knowledge, item *types.FetchedItem,
+	metadata map[string]string, resourceRef string,
+) (*types.SourceRevision, bool, error) {
+	if knowledge == nil || item == nil {
+		return nil, false, nil
+	}
+	store, ok := s.knowledgeService.GetRepository().(sourceRevisionStore)
+	if !ok {
+		return nil, false, nil
+	}
+	locator := item.URL
+	if locator == "" {
+		locator = item.FileName
+	}
+	candidate := &types.SourceRevision{
+		KnowledgeID: knowledge.ID, Locator: locator, ResourceRef: resourceRef,
+		NativeVersion: metadata["native_version"], ETag: metadata["etag"],
+		Size: int64(len(item.Content)), Mime: item.ContentType,
+	}
+	if len(item.Content) > 0 {
+		candidate.SourceHash = dataSourceContentHash(item.Content)
+	}
+	if !item.UpdatedAt.IsZero() {
+		t := item.UpdatedAt.UTC()
+		candidate.SourceUpdatedAt = &t
+	}
+	return store.UpsertSourceRevision(ctx, candidate)
+}
+
+func (s *DataSourceService) rollbackDataSourceRevision(
+	ctx context.Context, repo interfaces.KnowledgeRepository, knowledgeID string, revision *types.SourceRevision,
+) {
+	if revision == nil {
+		return
+	}
+	store, ok := repo.(sourceRevisionStore)
+	if !ok {
+		return
+	}
+	if err := store.RollbackSourceRevision(context.WithoutCancel(ctx), knowledgeID, revision.RevisionID); err != nil {
+		logger.Warnf(ctx, "failed to rollback source revision %s: %v", revision.RevisionID, err)
+	}
 }
 
 // dupIsSameNode reports whether a duplicate-content error means the parent still

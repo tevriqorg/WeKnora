@@ -788,6 +788,7 @@ func (s *knowledgeService) CreateKnowledgeFromManual(ctx context.Context,
 	meta := types.NewManualKnowledgeMetadata(cleanContent, status, 1)
 
 	knowledge := &types.Knowledge{
+		ID:               payload.RequestedKnowledgeID,
 		TenantID:         tenantID,
 		KnowledgeBaseID:  kbID,
 		Type:             types.KnowledgeTypeManual,
@@ -806,6 +807,11 @@ func (s *knowledgeService) CreateKnowledgeFromManual(ctx context.Context,
 	if err := knowledge.SetManualMetadata(meta); err != nil {
 		logger.Errorf(ctx, "Failed to set manual metadata: %v", err)
 		return nil, err
+	}
+	if payload.DerivedMetadata != nil {
+		if err := knowledge.SetDerivedMetadata(payload.DerivedMetadata); err != nil {
+			return nil, err
+		}
 	}
 	knowledge.EnsureManualDefaults()
 
@@ -1055,6 +1061,11 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 		logger.Errorf(ctx, "Failed to set manual metadata during update: %v", err)
 		return nil, err
 	}
+	if payload.DerivedMetadata != nil {
+		if err := existing.SetDerivedMetadata(payload.DerivedMetadata); err != nil {
+			return nil, err
+		}
+	}
 
 	if safeTitle != "" {
 		existing.Title = safeTitle
@@ -1301,6 +1312,18 @@ func (s *knowledgeService) bindChunkResources(
 	s.bindContentResources(ctx, tenantID, knowledgeID, b.String())
 }
 
+func applyDerivedSourceLocators(parsed []types.ParsedChunk, parents []types.ParsedParentChunk, locators types.SourceLocators) {
+	if len(locators) == 0 {
+		return
+	}
+	for i := range parsed {
+		parsed[i].SourceLocators = append(types.SourceLocators(nil), locators...)
+	}
+	for i := range parents {
+		parents[i].SourceLocators = append(types.SourceLocators(nil), locators...)
+	}
+}
+
 func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	kb *types.KnowledgeBase, knowledge *types.Knowledge, content string, doSync bool,
 ) error {
@@ -1318,10 +1341,11 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 		return nil
 	}
 
-	// Resolve embedded data:base64 images and remote http(s) images → storage, replace URLs.
-	// Runs before chunking so chunks contain stable provider:// URLs.
+	// Derived envelopes contain already-processed semantic media output. Do not
+	// resolve/fetch embedded images or schedule equivalent OCR/VLM again.
+	derivedMeta, _ := knowledge.DerivedMetadata()
 	var resolvedImages []docparser.StoredImage
-	if s.imageResolver != nil {
+	if derivedMeta == nil && s.imageResolver != nil {
 		fileSvc := s.resolveFileService(ctx, kb)
 		afterDataURI, fromDataURI, _ := s.imageResolver.ResolveDataURIImages(ctx, clean, fileSvc, knowledge.TenantID)
 		if len(fromDataURI) > 0 {
@@ -1408,6 +1432,10 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 				End:           c.End,
 			}
 		}
+	}
+
+	if derivedMeta != nil {
+		applyDerivedSourceLocators(parsed, opts.ParentChunks, derivedMeta.SourceLocators)
 	}
 
 	if doSync {
