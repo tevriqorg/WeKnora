@@ -151,9 +151,15 @@ func (s *resourceCatalogFileService) GetFileURL(ctx context.Context, filePath st
 }
 
 func (s *resourceCatalogFileService) DeleteFile(ctx context.Context, filePath string) error {
-	physical, isResource, err := s.resolve(ctx, filePath)
+	physical, resource, err := s.catalog.ResolvePath(ctx, filePath)
 	if err != nil {
 		return err
+	}
+	isResource := resource != nil
+	if resource != nil && resource.Ownership == types.ResourceOwnershipExternal {
+		// External means the registry may forget this object, but the backing
+		// bytes remain under the source system's authority.
+		return s.catalog.MarkDeleted(ctx, filePath)
 	}
 	if err := s.inner.DeleteFile(ctx, physical); err != nil {
 		return err

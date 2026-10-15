@@ -18,6 +18,8 @@ const (
 	ResourceStateDeleted        = "deleted"
 	ResourceLifecyclePersistent = "persistent"
 	ResourceLifecycleTemporary  = "temporary"
+	ResourceOwnershipManaged    = "managed"
+	ResourceOwnershipExternal   = "external"
 )
 
 // Resource binding owner types. A binding is a claim on a stored object: the
@@ -55,6 +57,7 @@ type StoredResource struct {
 	Size             int64          `json:"size" gorm:"not null;default:0"`
 	ContentHash      string         `json:"content_hash,omitempty" gorm:"type:varchar(64);not null;default:''"`
 	Lifecycle        string         `json:"lifecycle" gorm:"type:varchar(16);not null;default:'persistent'"`
+	Ownership        string         `json:"ownership" gorm:"type:varchar(16);not null;default:'managed'"`
 	ExpiresAt        *time.Time     `json:"expires_at,omitempty"`
 	State            string         `json:"state" gorm:"type:varchar(16);not null;default:'active'"`
 	CreatedAt        time.Time      `json:"created_at"`
@@ -75,6 +78,9 @@ func (r *StoredResource) BeforeCreate(_ *gorm.DB) error {
 	}
 	if r.Lifecycle == "" {
 		r.Lifecycle = ResourceLifecyclePersistent
+	}
+	if r.Ownership == "" {
+		r.Ownership = ResourceOwnershipManaged
 	}
 	if r.State == "" {
 		r.State = ResourceStateActive

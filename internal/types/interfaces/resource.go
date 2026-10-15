@@ -53,6 +53,7 @@ type ResourceRegistration struct {
 	Size         int64
 	ContentHash  string
 	Temporary    bool
+	Ownership    string
 }
 
 // ResourceCatalog maps public resource references to internal storage

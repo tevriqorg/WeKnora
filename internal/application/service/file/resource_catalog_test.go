@@ -65,8 +65,9 @@ func (c *catalogStub) ResolveAccessGrant(context.Context, string) (*types.Stored
 }
 
 type physicalFileStub struct {
-	savedPath string
-	readPath  string
+	savedPath  string
+	readPath   string
+	deletePath string
 }
 
 func (s *physicalFileStub) CheckConnectivity(context.Context) error { return nil }
@@ -83,7 +84,10 @@ func (s *physicalFileStub) GetFile(_ context.Context, path string) (io.ReadClose
 	return io.NopCloser(strings.NewReader("body")), nil
 }
 func (s *physicalFileStub) GetFileURL(context.Context, string) (string, error) { return "", nil }
-func (s *physicalFileStub) DeleteFile(context.Context, string) error           { return nil }
+func (s *physicalFileStub) DeleteFile(_ context.Context, path string) error {
+	s.deletePath = path
+	return nil
+}
 func (s *physicalFileStub) CopyFile(context.Context, string, uint64, string) (string, error) {
 	return "", nil
 }
@@ -113,4 +117,18 @@ func TestResourceCatalogFileServiceReturnsShortExternalGrantURL(t *testing.T) {
 	externalURL, err := svc.GetFileURL(context.Background(), ref)
 	require.NoError(t, err)
 	require.Equal(t, "https://weknora.example.com/r/GrantTokenAbCdEfGhIjKl", externalURL)
+}
+
+func TestResourceCatalogFileServiceNeverDeletesExternalBytes(t *testing.T) {
+	inner := &physicalFileStub{savedPath: "local://7/external/source.pdf"}
+	catalog := &catalogStub{
+		ref: "resource://AbCdEfGhIjKlMnOpQrStUv",
+		resource: &types.StoredResource{
+			ID: "resource-external", Handle: "AbCdEfGhIjKlMnOpQrStUv", TenantID: 7,
+			PhysicalPath: "local://7/external/source.pdf", Ownership: types.ResourceOwnershipExternal,
+		},
+	}
+	svc := NewResourceCatalogFileService(inner, catalog)
+	require.NoError(t, svc.DeleteFile(context.Background(), catalog.ref))
+	require.Empty(t, inner.deletePath, "external physical bytes are never deleted")
 }
