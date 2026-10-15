@@ -259,3 +259,37 @@ func TestMergeKnowledgeReleaseURLsOmitsSourceFileBinding(t *testing.T) {
 		t.Fatalf("release URLs = %v, want only extracted image %q", urls, image)
 	}
 }
+
+func TestG1KnowledgeDeleteReleasesExternalSourceWithoutDeletingBytes(t *testing.T) {
+	catalog, _ := newResourceCatalogForTest(t)
+	ctx := context.Background()
+	source, err := catalog.Register(ctx, 7, "local://7/archive/source.pdf", interfaces.ResourceRegistration{
+		Kind: "file", Ownership: types.ResourceOwnershipExternal,
+	})
+	if err != nil {
+		t.Fatalf("register external source: %v", err)
+	}
+	if err := catalog.Bind(ctx, source, types.ResourceOwnerKnowledge, "doc", types.ResourceRelationSourceFile); err != nil {
+		t.Fatalf("bind external source: %v", err)
+	}
+
+	f := newDocumentWriteFixture(t)
+	f.svc.resourceCatalog = catalog
+	if err := f.db.Model(&types.Knowledge{}).Where("id = ?", "doc").Updates(map[string]interface{}{
+		"type": "file", "file_path": source, "file_name": "source.pdf", "file_type": "pdf",
+	}).Error; err != nil {
+		t.Fatalf("prepare file knowledge: %v", err)
+	}
+	if err := f.svc.DeleteKnowledge(f.ctx, "doc"); err != nil {
+		t.Fatalf("delete knowledge: %v", err)
+	}
+	for _, deleted := range f.files.deleted {
+		if deleted == source {
+			t.Fatalf("external authoritative source was physically deleted: %v", f.files.deleted)
+		}
+	}
+	resource, err := catalog.Resolve(ctx, source)
+	if err != nil || resource == nil {
+		t.Fatalf("external resource should remain resolvable: %v", err)
+	}
+}

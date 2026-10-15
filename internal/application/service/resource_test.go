@@ -246,3 +246,48 @@ func TestResourceCatalogRejectsUnsupportedPhysicalPath(t *testing.T) {
 	_, err := catalog.Register(context.Background(), 7, "https://example.com/a.png", interfaces.ResourceRegistration{})
 	require.ErrorContains(t, err, "unsupported provider")
 }
+
+func TestResourceCatalogExternalReleaseNeverAuthorizesPhysicalDelete(t *testing.T) {
+	catalog, db := newResourceCatalogForTest(t)
+	ctx := context.Background()
+	ref, err := catalog.Register(ctx, 7, "local://7/external/source.pdf", interfaces.ResourceRegistration{
+		OriginalName: "source.pdf", Ownership: types.ResourceOwnershipExternal,
+	})
+	require.NoError(t, err)
+	require.NoError(t, catalog.Bind(ctx, ref, types.ResourceOwnerKnowledge, "kn-1", types.ResourceRelationSourceFile))
+
+	remaining, err := catalog.Release(ctx, ref, types.ResourceOwnerKnowledge, "kn-1")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, remaining, "external resources use a non-deletable sentinel after final release")
+	resource, err := catalog.Resolve(ctx, ref)
+	require.NoError(t, err)
+	require.Equal(t, types.ResourceOwnershipExternal, resource.Ownership)
+
+	var bindings int64
+	require.NoError(t, db.Model(&types.ResourceBinding{}).Where("resource_id = ?", resource.ID).Count(&bindings).Error)
+	require.Zero(t, bindings, "release still removes ownership metadata")
+}
+
+func TestStoredResourceOwnershipDefaultsManaged(t *testing.T) {
+	_, db := newResourceCatalogForTest(t)
+	resource := &types.StoredResource{
+		Handle: "AbCdEfGhIjKlMnOpQrStUv", TenantID: 7, Provider: "local",
+		PhysicalPath: "local://7/a", LocationHash: "hash-a",
+	}
+	require.NoError(t, db.Create(resource).Error)
+	require.Equal(t, types.ResourceOwnershipManaged, resource.Ownership)
+}
+
+func TestResourceCatalogRejectsOwnershipConflictForSamePhysicalObject(t *testing.T) {
+	catalog, _ := newResourceCatalogForTest(t)
+	ctx := context.Background()
+	physical := "local://7/external/source.pdf"
+	_, err := catalog.Register(ctx, 7, physical, interfaces.ResourceRegistration{
+		Ownership: types.ResourceOwnershipExternal,
+	})
+	require.NoError(t, err)
+	_, err = catalog.Register(ctx, 7, physical, interfaces.ResourceRegistration{
+		Ownership: types.ResourceOwnershipManaged,
+	})
+	require.ErrorContains(t, err, "resource ownership conflict")
+}
