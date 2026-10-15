@@ -14,6 +14,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/middleware/asynqdl"
+	appRuntime "github.com/Tencent/WeKnora/internal/runtime"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -42,6 +43,7 @@ type AsynqTaskParams struct {
 	DataTableSummary     interfaces.TaskHandler `name:"dataTableSummary"`
 	ImageMultimodal      interfaces.TaskHandler `name:"imageMultimodal"`
 	KnowledgePostProcess interfaces.TaskHandler `name:"knowledgePostProcess"`
+	TemporalEnrichment   interfaces.TaskHandler `name:"temporalEnrichment"`
 	KnowledgeAutoTag     interfaces.TaskHandler `name:"knowledgeAutoTag"`
 	KnowledgeBaseProfile interfaces.TaskHandler `name:"knowledgeBaseProfile"`
 	WikiIngest           interfaces.TaskHandler `name:"wikiIngest"`
@@ -49,6 +51,7 @@ type AsynqTaskParams struct {
 	MemoryService        interfaces.MemoryService
 	DeadLetterRepo       interfaces.TaskDeadLetterRepository
 	SpanTracker          service.SpanTracker
+	ResourceCleaner      interfaces.ResourceCleaner
 }
 
 // defaultRedisOpTimeout is the previous hard-coded read timeout. The 100ms
@@ -304,6 +307,7 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 
 	// Register knowledge post process handler
 	mux.HandleFunc(types.TypeKnowledgePostProcess, params.KnowledgePostProcess.Handle)
+	mux.HandleFunc(types.TypeTemporalEnrichment, params.TemporalEnrichment.Handle)
 	mux.HandleFunc(types.TypeKnowledgeAutoTag, params.KnowledgeAutoTag.Handle)
 	mux.HandleFunc(types.TypeKnowledgeBaseProfile, params.KnowledgeBaseProfile.Handle)
 
@@ -319,21 +323,30 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	// Register long-term memory distillation handler
 	mux.HandleFunc(types.TypeMemoryExtract, params.MemoryService.Handle)
 
-	// Run the same mux on every pool. Shared and dedicated servers intentionally
-	// overlap, but Redis dequeue is atomic, so each task still executes once.
+	// Run the same mux only on pools enabled by the process runtime role.
+	// role=all preserves the upstream six-pool default; role=worker can select
+	// a subset; role=api never reaches this function from the container.
+	runtimeCfg := appRuntime.MustRuntimeConfigFromEnv()
 	runPool := func(name string, srv *asynq.Server) {
+		if !runtimeCfg.WorkerPoolEnabled(name) {
+			return
+		}
+		params.ResourceCleaner.RegisterWithName("AsynqPool:"+name, func() error {
+			srv.Shutdown()
+			return nil
+		})
 		go func() {
 			if err := srv.Run(mux); err != nil {
 				log.Fatalf("could not run %s asynq server: %v", name, err)
 			}
 		}()
 	}
-	runPool("core-pool", params.CoreServer)
-	runPool("postprocess-pool", params.PostProcessServer)
-	runPool("enrichment-pool", params.EnrichmentServer)
-	runPool("maintenance-pool", params.MaintenanceServer)
-	runPool("shared-pool", params.SharedServer)
-	runPool("wiki-pool", params.WikiServer)
+	runPool(types.WorkerPoolCore, params.CoreServer)
+	runPool(types.WorkerPoolPostProcess, params.PostProcessServer)
+	runPool(types.WorkerPoolEnrichment, params.EnrichmentServer)
+	runPool(types.WorkerPoolMaintenance, params.MaintenanceServer)
+	runPool(types.WorkerPoolShared, params.SharedServer)
+	runPool(types.WorkerPoolWiki, params.WikiServer)
 	return mux
 }
 

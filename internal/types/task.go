@@ -46,6 +46,8 @@ const (
 	// the enrichment pool because it is a background LLM call whose latency
 	// nobody is waiting on.
 	QueueMemory = "memory"
+	// QueueTemporal carries AIBOX temporal enrichment in the existing enrichment pool.
+	QueueTemporal = "temporal"
 )
 
 // QueueDefinition is the single source of truth for queue topology. Worker
@@ -79,6 +81,7 @@ var queueDefinitions = []QueueDefinition{
 	{Name: QueueGraph, Pool: WorkerPoolEnrichment, Weight: 1, SharedWeight: 1, TaskTypes: []string{TypeChunkExtract}},
 	{Name: QueueQuestion, Pool: WorkerPoolEnrichment, Weight: 1, SharedWeight: 1, TaskTypes: []string{TypeQuestionGeneration}},
 	{Name: QueueMemory, Pool: WorkerPoolEnrichment, Weight: 1, SharedWeight: 1, TaskTypes: []string{TypeMemoryExtract}},
+	{Name: QueueTemporal, Pool: WorkerPoolEnrichment, Weight: 1, SharedWeight: 1, TaskTypes: []string{TypeTemporalEnrichment}},
 	{Name: QueueSync, Pool: WorkerPoolMaintenance, Weight: 2, TaskTypes: []string{TypeDataSourceSync}},
 	{Name: QueueMaintenance, Pool: WorkerPoolMaintenance, Weight: 1, TaskTypes: []string{
 		TypeFAQImport, TypeKBClone, TypeIndexDelete, TypeKBDelete,
@@ -255,6 +258,8 @@ const (
 	TypeTemporaryDocumentProcess = "temporary_document:process" // 会话临时文档解析任务
 	// TypeMemoryExtract 长期记忆抽取任务（会话轮次防抖后异步执行）
 	TypeMemoryExtract = "memory:extract"
+	// TypeTemporalEnrichment builds deterministic temporal Episodes for one Knowledge.
+	TypeTemporalEnrichment = "temporal:enrichment"
 )
 
 // MemoryExtractPayload carries everything the background distillation task
@@ -384,6 +389,14 @@ type QuestionGenerationPayload struct {
 }
 
 // SummaryGenerationPayload represents the summary generation task payload
+type TemporalEnrichmentPayload struct {
+	TracingContext
+	TenantID        uint64 `json:"tenant_id"`
+	KnowledgeBaseID string `json:"knowledge_base_id"`
+	KnowledgeID     string `json:"knowledge_id"`
+	Attempt         int    `json:"attempt,omitempty"`
+}
+
 type SummaryGenerationPayload struct {
 	TracingContext
 	TenantID        uint64 `json:"tenant_id"`
