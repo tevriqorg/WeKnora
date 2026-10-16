@@ -332,6 +332,12 @@ type ManualKnowledgePayload struct {
 	TagIDs        []string                   `json:"tag_ids"`
 	Channel       string                     `json:"channel"`
 	ProcessConfig *KnowledgeProcessOverrides `json:"process_config,omitempty"`
+
+	// Internal-only fields used by the AIBOX derived-ingestion path. They are
+	// deliberately excluded from JSON so public API callers cannot force IDs
+	// or inject server-owned provenance.
+	RequestedKnowledgeID string                    `json:"-"`
+	DerivedMetadata      *DerivedKnowledgeMetadata `json:"-"`
 }
 
 // KnowledgeSearchScope defines a (tenant_id, knowledge_base_id) scope for knowledge search (e.g. own KBs + shared KBs).
@@ -415,12 +421,16 @@ func (k *Knowledge) SetManualMetadata(meta *ManualKnowledgeMetadata) error {
 	if err != nil {
 		return err
 	}
-	if state, ok := old[KnowledgeTransferMetadataKey]; ok {
+	for _, reservedKey := range []string{KnowledgeTransferMetadataKey, KnowledgeDerivedMetadataKey} {
+		state, ok := old[reservedKey]
+		if !ok {
+			continue
+		}
 		fields, err := jsonValue.Map()
 		if err != nil {
 			return err
 		}
-		fields[KnowledgeTransferMetadataKey] = state
+		fields[reservedKey] = state
 		jsonValue, err = json.Marshal(fields)
 		if err != nil {
 			return err

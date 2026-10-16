@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"time"
 
@@ -217,6 +218,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	willSpawnQuestion := len(textChunks) > 0 && kb.NeedsEmbeddingModel() &&
 		eff.QuestionGenerationConfig.Enabled
 	willSpawnWiki := kb.IndexingStrategy.WikiEnabled && len(textChunks) > 0
+	willSpawnTemporal := temporalEnrichmentEnabled() && len(textChunks) > 0
 	willSpawnAutoTag := kb.Type == types.KnowledgeBaseTypeDocument &&
 		kb.AutoTagConfig != nil && kb.AutoTagConfig.Enabled && len(textChunks) > 0
 	enqueuedAutoTag := false
@@ -258,6 +260,9 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	}
 	expectedSubtasks += questionBatchCount
 	if willSpawnWiki {
+		expectedSubtasks++
+	}
+	if willSpawnTemporal {
 		expectedSubtasks++
 	}
 	expectedSubtasks += graphChunkCount
@@ -435,6 +440,13 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		}
 	}
 
+	// Temporal enrichment owns exactly one finalizing slot per Knowledge. The
+	// worker serializes its deterministic evidence windows internally.
+	enqueuedTemporal := false
+	if willSpawnTemporal {
+		enqueuedTemporal = s.enqueueTemporalEnrichmentTask(ctx, payload, attempt)
+	}
+
 	// 6. Schedule the Wiki trigger. The durable per-knowledge op already owns
 	//    its finalizing slot because it was committed atomically with the state
 	//    transition above. A trigger failure is returned so the post-process
@@ -478,11 +490,17 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		if willSpawnWiki {
 			plannedOwned++
 		}
+		if willSpawnTemporal {
+			plannedOwned++
+		}
 		actualOwned := enqueuedQuestionCount + enqueuedGraphCount
 		if enqueuedSummary {
 			actualOwned++
 		}
 		if wikiSlotOwned {
+			actualOwned++
+		}
+		if enqueuedTemporal {
 			actualOwned++
 		}
 		if shortfall := plannedOwned - actualOwned; shortfall > 0 {
@@ -509,6 +527,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		"wiki_slot_owned":         wikiSlotOwned,
 		"enqueued_graph":          enqueuedGraphCount > 0,
 		"enqueued_graph_count":    enqueuedGraphCount,
+		"enqueued_temporal":       enqueuedTemporal,
 		"enqueued_auto_tag":       enqueuedAutoTag,
 	}
 	s.tracker().EndSpan(ctx, postSpan, postOutput)
@@ -561,6 +580,40 @@ func (s *KnowledgePostProcessService) enqueueAutoTagTask(
 		return false
 	}
 	logger.Infof(ctx, "[KnowledgePostProcess] Enqueued automatic tagging for %s", payload.KnowledgeID)
+	return true
+}
+
+func temporalEnrichmentEnabled() bool {
+	switch os.Getenv("WEKNORA_TEMPORAL_ENABLED") {
+	case "1", "true", "TRUE", "yes", "YES":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *KnowledgePostProcessService) enqueueTemporalEnrichmentTask(
+	ctx context.Context, payload types.KnowledgePostProcessPayload, attempt int,
+) bool {
+	if s.taskEnqueuer == nil {
+		return false
+	}
+	taskPayload := types.TemporalEnrichmentPayload{
+		TenantID: payload.TenantID, KnowledgeBaseID: payload.KnowledgeBaseID,
+		KnowledgeID: payload.KnowledgeID, Attempt: attempt,
+	}
+	langfuse.InjectTracing(ctx, &taskPayload)
+	payloadBytes, err := json.Marshal(taskPayload)
+	if err != nil {
+		logger.Warnf(ctx, "[KnowledgePostProcess] Failed to marshal temporal enrichment payload: %v", err)
+		return false
+	}
+	task := asynq.NewTask(types.TypeTemporalEnrichment, payloadBytes,
+		asynq.Queue(types.QueueTemporal), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
+	if _, err := s.taskEnqueuer.Enqueue(task); err != nil {
+		logger.Warnf(ctx, "[KnowledgePostProcess] Failed to enqueue temporal enrichment for %s: %v", payload.KnowledgeID, err)
+		return false
+	}
 	return true
 }
 

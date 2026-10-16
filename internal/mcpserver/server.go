@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	apprepo "github.com/Tencent/WeKnora/internal/application/repository"
+	appservice "github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/ratelimit"
@@ -55,6 +57,7 @@ type Server struct {
 	fileService      interfaces.FileService
 	storageResolver  interfaces.StorageBackendResolver
 	endpointRepo     interfaces.MCPEndpointRepository
+	aiboxQuery       interfaces.AIBOXQueryService
 	db               *gorm.DB
 	cfg              *config.Config
 
@@ -101,6 +104,9 @@ func NewServer(
 		fileService:      fileService,
 		storageResolver:  storageResolver,
 		limiter:          ratelimit.New(redisClient, rateLimitKeyPrefix, time.Minute, ""),
+	}
+	if sessionService != nil && db != nil {
+		s.aiboxQuery = appservice.NewAIBOXQueryService(sessionService, apprepo.NewTemporalRepository(db))
 	}
 	// The local fallback map only grows without periodic eviction; the server
 	// lives for the whole process so the cleanup goroutine never stops.
