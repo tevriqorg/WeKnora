@@ -55,12 +55,23 @@ func (s *resourceCatalog) Register(
 	if _, ok := types.ParseResourcePath(physicalPath); ok {
 		return physicalPath, nil
 	}
+	desiredOwnership := strings.TrimSpace(meta.Ownership)
+	if desiredOwnership != "" && desiredOwnership != types.ResourceOwnershipManaged && desiredOwnership != types.ResourceOwnershipExternal {
+		return "", fmt.Errorf("unsupported resource ownership %q", desiredOwnership)
+	}
 	locationHash := resourceLocationHash(physicalPath)
 	existing, err := s.repo.GetByTenantLocation(ctx, tenantID, locationHash)
 	if err != nil {
 		return "", err
 	}
 	if existing != nil {
+		existingOwnership := existing.Ownership
+		if existingOwnership == "" {
+			existingOwnership = types.ResourceOwnershipManaged
+		}
+		if desiredOwnership != "" && existingOwnership != desiredOwnership {
+			return "", fmt.Errorf("resource ownership conflict: existing=%s requested=%s", existingOwnership, desiredOwnership)
+		}
 		return types.BuildResourcePath(existing.Handle), nil
 	}
 
@@ -76,6 +87,10 @@ func (s *resourceCatalog) Register(
 	lifecycle := types.ResourceLifecyclePersistent
 	if meta.Temporary {
 		lifecycle = types.ResourceLifecycleTemporary
+	}
+	ownership := desiredOwnership
+	if ownership == "" {
+		ownership = types.ResourceOwnershipManaged
 	}
 	for attempt := 0; attempt < 4; attempt++ {
 		handle, tokenErr := randomResourceToken()
@@ -95,6 +110,7 @@ func (s *resourceCatalog) Register(
 			Size:             meta.Size,
 			ContentHash:      meta.ContentHash,
 			Lifecycle:        lifecycle,
+			Ownership:        ownership,
 		}
 		if err := s.repo.Create(ctx, resource); err == nil {
 			return types.BuildResourcePath(handle), nil
@@ -103,6 +119,13 @@ func (s *resourceCatalog) Register(
 		}
 		existing, lookupErr := s.repo.GetByTenantLocation(ctx, tenantID, locationHash)
 		if lookupErr == nil && existing != nil {
+			existingOwnership := existing.Ownership
+			if existingOwnership == "" {
+				existingOwnership = types.ResourceOwnershipManaged
+			}
+			if desiredOwnership != "" && existingOwnership != desiredOwnership {
+				return "", fmt.Errorf("resource ownership conflict: existing=%s requested=%s", existingOwnership, desiredOwnership)
+			}
 			return types.BuildResourcePath(existing.Handle), nil
 		}
 	}
@@ -220,7 +243,18 @@ func (s *resourceCatalog) Release(
 	if err := s.repo.DeleteBinding(ctx, resource.ID, ownerType, ownerID); err != nil {
 		return -1, err
 	}
-	return s.repo.CountBindings(ctx, resource.ID)
+	remaining, err := s.repo.CountBindings(ctx, resource.ID)
+	if err != nil {
+		return -1, err
+	}
+	// External resources are catalogued for stable identity and authorization,
+	// but WeKnora never owns their physical bytes. Returning a positive sentinel
+	// keeps every existing release/delete caller on the safe side after the
+	// owner's binding has been removed.
+	if resource.Ownership == types.ResourceOwnershipExternal && remaining <= 0 {
+		return 1, nil
+	}
+	return remaining, nil
 }
 
 func (s *resourceCatalog) ListReferencesByOwner(

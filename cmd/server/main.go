@@ -41,6 +41,11 @@ import (
 )
 
 func main() {
+	runtimeCfg, cfgErr := runtime.RuntimeConfigFromEnv()
+	if cfgErr != nil {
+		logger.Fatalf(context.Background(), "Invalid runtime configuration: %v", cfgErr)
+	}
+
 	// Set Gin mode
 	if os.Getenv("GIN_MODE") == "release" {
 		gin.SetMode(gin.ReleaseMode)
@@ -57,6 +62,38 @@ func main() {
 
 	// Build dependency injection container
 	c := container.BuildContainer(runtime.GetContainer())
+
+	if !runtimeCfg.RunsAPISurface() {
+		err := c.Invoke(func(
+			cfg *config.Config,
+			resourceCleaner interfaces.ResourceCleaner,
+			systemSettingSvc interfaces.SystemSettingService,
+			modelCatalogSvc *service.ModelCatalogService,
+		) error {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			modelCatalogSvc.Start(ctx)
+			if err := systemSettingSvc.SubscribeRedis(ctx); err != nil {
+				logger.Warnf(ctx, "[system_settings] subscribe failed: %v", err)
+			}
+			logger.Infof(ctx, "Worker runtime is running pools=%v", runtimeCfg.WorkerPools)
+			signals := make(chan os.Signal, 1)
+			signal.Notify(signals, shutdownSignals...)
+			sig := <-signals
+			logger.Infof(ctx, "Received signal: %v, stopping worker runtime...", sig)
+			cancel()
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+			defer cleanupCancel()
+			if errs := resourceCleaner.Cleanup(cleanupCtx); len(errs) > 0 {
+				logger.Errorf(context.Background(), "Errors occurred during resource cleanup: %v", errs)
+			}
+			return nil
+		})
+		if err != nil {
+			logger.Fatalf(context.Background(), "Failed to run worker application: %v", err)
+		}
+		return
+	}
 
 	// One-shot bootstrap hooks (e.g. promote env-named user to system
 	// admin). Best-effort: never aborts startup — see bootstrap.go.

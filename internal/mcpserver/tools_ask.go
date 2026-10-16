@@ -36,6 +36,11 @@ func askTool() mcp.Tool {
 		mcp.WithArray("knowledge_base_ids", mcp.WithStringItems(),
 			mcp.Description("Optional knowledge base ids or names to retrieve from; defaults to the "+
 				"endpoint scope or the agent's own configuration")),
+		mcp.WithString("temporal_mode",
+			mcp.Description("Temporal query mode. auto detects explicit current/history/as-of intent; current, valid_at, known_at, and history force temporal retrieval."),
+			mcp.Enum(string(types.AIBOXQueryModeAuto), string(types.AIBOXQueryModeCurrent), string(types.AIBOXQueryModeValidAt), string(types.AIBOXQueryModeKnownAt), string(types.AIBOXQueryModeHistory))),
+		mcp.WithString("valid_time", mcp.Description("RFC3339 or YYYY-MM-DD reality time for valid_at mode")),
+		mcp.WithString("known_time", mcp.Description("RFC3339 or YYYY-MM-DD knowledge time for known_at mode")),
 		// Not read-only: it creates a session and messages, and the configured
 		// agent may run its own tools. Clients must not auto-approve it.
 		mcp.WithReadOnlyHintAnnotation(false),
@@ -78,12 +83,39 @@ func (s *Server) handleAsk(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	queryKBIDs, err := s.resolveAIBOXQueryKnowledgeBases(ctx, ep, agent, kbIDs)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 	session, err := s.resolveAskSession(ctx, ep, req.GetString("session_id", ""), question)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	answer, refs, err := s.runQA(ctx, session, agent, question, kbIDs)
+	var aiboxResult *types.AIBOXQueryResult
+	if s.aiboxQuery != nil {
+		aiboxResult, err = s.aiboxQuery.Query(ctx, types.AIBOXQueryInput{
+			Query: question, KBIDs: queryKBIDs, Mode: types.AIBOXQueryMode(req.GetString("temporal_mode", string(types.AIBOXQueryModeAuto))),
+			ValidTime: req.GetString("valid_time", ""), KnownTime: req.GetString("known_time", ""),
+		})
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("failed to prepare unified query", err), nil
+		}
+	}
+	if aiboxResult != nil && aiboxResult.TemporalRequired && aiboxResult.TemporalDegraded {
+		answer := temporalUnavailableAnswer(aiboxResult)
+		structured := map[string]any{
+			"answer": answer, "session_id": session.ID, "agent_id": agent.ID,
+			"references": []askReference{}, "aibox_query": aiboxResult,
+		}
+		return mcp.NewToolResultStructured(structured, fmt.Sprintf("%s\n\nsession_id: %s", answer, session.ID)), nil
+	}
+
+	modelQuery := question
+	if aiboxResult != nil && aiboxResult.TemporalRequired {
+		modelQuery = renderAIBOXQueryContext(question, aiboxResult)
+	}
+	answer, refs, err := s.runQA(ctx, session, agent, question, modelQuery, queryKBIDs)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("failed to answer", err), nil
 	}
@@ -92,6 +124,9 @@ func (s *Server) handleAsk(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 		"session_id": session.ID,
 		"agent_id":   agent.ID,
 		"references": refs,
+	}
+	if aiboxResult != nil {
+		structured["aibox_query"] = aiboxResult
 	}
 	var text string
 	if len(refs) > 0 {
@@ -178,6 +213,83 @@ func (s *Server) resolveAskKnowledgeBases(
 	return nil, nil
 }
 
+func (s *Server) resolveAIBOXQueryKnowledgeBases(
+	ctx context.Context, ep *types.MCPEndpoint, agent *types.CustomAgent, resolved []string,
+) ([]string, error) {
+	if len(resolved) > 0 {
+		return resolved, nil
+	}
+	if agent != nil && len(agent.Config.KnowledgeBases) > 0 {
+		kbs, err := s.selectKnowledgeBases(ctx, ep, agent.Config.KnowledgeBases)
+		if err != nil {
+			return nil, err
+		}
+		if ids := knowledgeBaseIDs(kbs); len(ids) > 0 {
+			return ids, nil
+		}
+	}
+	kbs, err := s.allowedKnowledgeBases(ctx, ep)
+	if err != nil {
+		return nil, err
+	}
+	return knowledgeBaseIDs(kbs), nil
+}
+
+func temporalUnavailableAnswer(result *types.AIBOXQueryResult) string {
+	reason := "temporal knowledge is unavailable or incomplete"
+	if result != nil && len(result.DegradedReasons) > 0 {
+		reason = strings.Join(result.DegradedReasons, "; ")
+	}
+	return "I cannot safely answer this current/history/as-of question from document-only evidence because the temporal layer is degraded: " + reason
+}
+
+const aiboxAskEvidenceMaxRunes = 1200
+
+func truncateAIBOXEvidence(value string) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) <= aiboxAskEvidenceMaxRunes {
+		return value
+	}
+	return string(runes[:aiboxAskEvidenceMaxRunes]) + "…"
+}
+
+func renderAIBOXQueryContext(question string, result *types.AIBOXQueryResult) string {
+	if result == nil {
+		return question
+	}
+	var b strings.Builder
+	b.WriteString("Answer the original question using the normalized AIBOX evidence below. ")
+	b.WriteString("Temporal evidence is authoritative for time-sensitive state. Preserve concurrent claims/conflicts; never choose one conflicting authority as truth without support.\n\n")
+	fmt.Fprintf(&b, "Original question: %s\n", question)
+	fmt.Fprintf(&b, "Temporal mode: %s; evaluated_at=%s", result.EffectiveMode, result.EvaluatedAt.UTC().Format(time.RFC3339))
+	if result.EffectiveTime != nil {
+		fmt.Fprintf(&b, "; effective_time=%s", result.EffectiveTime.UTC().Format(time.RFC3339))
+	}
+	b.WriteString("\n\nDocument evidence:\n")
+	for i, doc := range result.Documents {
+		if i >= 10 {
+			break
+		}
+		fmt.Fprintf(&b, "[D%d] document=%s chunk=%s title=%q score=%.4f\n%s\n", i+1, doc.KnowledgeID, doc.ChunkID, doc.KnowledgeTitle, doc.Score, truncateAIBOXEvidence(doc.Content))
+	}
+	b.WriteString("\nTemporal facts:\n")
+	for i, fact := range result.TemporalFacts {
+		if i >= 30 {
+			break
+		}
+		fmt.Fprintf(&b, "[T%d] fact_uuid=%s authorities=%v episodes=%v valid_at=%v invalid_at=%v created_at=%s source=%q relation=%q target=%q\n%s\n",
+			i+1, fact.FactUUID, fact.AuthorityKeys, fact.Episodes, fact.ValidAt, fact.InvalidAt, fact.CreatedAt.UTC().Format(time.RFC3339), fact.Source.Name, fact.Relation, fact.Target.Name, truncateAIBOXEvidence(fact.Fact))
+	}
+	if len(result.Conflicts) > 0 {
+		b.WriteString("\nConflicts (do not collapse):\n")
+		for i, conflict := range result.Conflicts {
+			fmt.Fprintf(&b, "[C%d] key=%s claim_count=%d\n", i+1, conflict.Key, len(conflict.Claims))
+		}
+	}
+	return b.String()
+}
+
 func (s *Server) resolveAskSession(
 	ctx context.Context, ep *types.MCPEndpoint, sessionID, question string,
 ) (*types.Session, error) {
@@ -211,7 +323,7 @@ func (s *Server) resolveAskSession(
 // runQA executes one turn synchronously and returns the final answer and
 // the references it cited. It mirrors the IM channel's non-streaming path.
 func (s *Server) runQA(
-	ctx context.Context, session *types.Session, agent *types.CustomAgent, question string, kbIDs []string,
+	ctx context.Context, session *types.Session, agent *types.CustomAgent, question, modelQuery string, kbIDs []string,
 ) (string, []askReference, error) {
 	ctx, cancel := context.WithTimeout(ctx, askTimeout)
 	defer cancel()
@@ -320,7 +432,7 @@ func (s *Server) runQA(
 		}
 		req := &types.QARequest{
 			Session:            session,
-			Query:              question,
+			Query:              modelQuery,
 			AssistantMessageID: assistantMsg.ID,
 			UserMessageID:      userMsg.ID,
 			CustomAgent:        agent,

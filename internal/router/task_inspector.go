@@ -92,6 +92,7 @@ var taskTypesForKnowledgeCancel = map[string]struct{}{
 	types.TypeQuestionGeneration:   {},
 	types.TypeSummaryGeneration:    {},
 	types.TypeChunkExtract:         {},
+	types.TypeTemporalEnrichment:   {},
 }
 
 // listPageSize caps each Redis LIST call. Asynq pages tasks, so we

@@ -46,14 +46,39 @@ func (r *sweepFakeRepo) FindByMetadataKeyPrefix(ctx context.Context, tenantID ui
 type sweepFakeKS struct {
 	interfaces.KnowledgeService
 	repo               interfaces.KnowledgeRepository
-	events             []string // ordered log of "delete:<id>" and "create:<fname>"
+	events             []string // ordered create/delete/replace log
 	deleted            []string
-	createErr          error            // if set, CreateKnowledgeFromFile returns it after logging
-	deleteErr          error            // if set, DeleteKnowledge returns it after logging
-	createURLKnowledge *types.Knowledge // if set, CreateKnowledgeFromURL returns it
+	createErr          error
+	deleteErr          error
+	createURLKnowledge *types.Knowledge
+	replacedFileIDs    []string
+	replacedURLIDs     []string
+	replaceErr         error
 }
 
 func (k *sweepFakeKS) GetRepository() interfaces.KnowledgeRepository { return k.repo }
+
+func (k *sweepFakeKS) ReplaceKnowledgeFile(
+	_ context.Context, id string, _ *multipart.FileHeader, fileName string, _ map[string]string,
+) (*types.Knowledge, error) {
+	k.events = append(k.events, "replace-file:"+id)
+	k.replacedFileIDs = append(k.replacedFileIDs, id)
+	if k.replaceErr != nil {
+		return nil, k.replaceErr
+	}
+	return &types.Knowledge{ID: id, FileName: fileName}, nil
+}
+
+func (k *sweepFakeKS) ReplaceKnowledgeURL(
+	_ context.Context, id, rawURL, fileName, title string, _ map[string]string,
+) (*types.Knowledge, error) {
+	k.events = append(k.events, "replace-url:"+id)
+	k.replacedURLIDs = append(k.replacedURLIDs, id)
+	if k.replaceErr != nil {
+		return nil, k.replaceErr
+	}
+	return &types.Knowledge{ID: id, Source: rawURL, FileName: fileName, Title: title}, nil
+}
 
 func (k *sweepFakeKS) CreateKnowledgeFromURL(
 	_ context.Context, _ string, _ string, _ string, _ string, _ *bool,
