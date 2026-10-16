@@ -844,9 +844,20 @@ func runStartupMigrations(
 	}
 	defer conn.Close()
 
-	lockSQL := `SELECT pg_advisory_lock(hashtext(current_database()), hashtext('` + postgresStartupMigrationLockName + `'))`
-	if _, err := conn.ExecContext(ctx, lockSQL); err != nil {
-		return fmt.Errorf("acquire startup migration lock: %w", err)
+	lockSQL := `SELECT pg_try_advisory_lock(hashtext(current_database()), hashtext('` + postgresStartupMigrationLockName + `'))`
+	for {
+		var acquired bool
+		if err := conn.QueryRowContext(ctx, lockSQL).Scan(&acquired); err != nil {
+			return fmt.Errorf("acquire startup migration lock: %w", err)
+		}
+		if acquired {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for startup migration lock: %w", ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 	defer func() {
 		unlockSQL := `SELECT pg_advisory_unlock(hashtext(current_database()), hashtext('` + postgresStartupMigrationLockName + `'))`
