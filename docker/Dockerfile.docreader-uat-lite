@@ -1,0 +1,40 @@
+# AIBOX Vela UAT runtime variant.
+# Same pinned DocReader source + locked Python dependencies as the upstream image,
+# but intentionally omits LibreOffice, Playwright browser downloads and browser OS deps.
+# This keeps Markdown/text/PDF/basic Office parsing available for owner UAT while
+# avoiding multi-GB runtime layers on the constrained Vela root disk.
+
+FROM python:3.10.18-bookworm AS builder
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc python3-dev libjpeg-dev zlib1g-dev libffi-dev libgl1 libglib2.0-0 \
+    curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+COPY packages/ /app/packages/
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in amd64) PARCH=x86_64;; arm64) PARCH=aarch_64;; *) exit 1;; esac; \
+    P="protoc-3.19.4-linux-${PARCH}.zip"; \
+    if [ -f "/app/packages/$P" ]; then cp "/app/packages/$P" /tmp/protoc.zip; \
+    else curl -L "https://github.com/protocolbuffers/protobuf/releases/download/v3.19.4/$P" -o /tmp/protoc.zip; fi; \
+    unzip -q /tmp/protoc.zip -d /usr/local; chmod +x /usr/local/bin/protoc
+COPY docreader/pyproject.toml docreader/uv.lock ./
+RUN pip install --no-cache-dir uv --break-system-packages && python -m uv sync --locked --no-dev
+COPY docreader docreader
+ENV PATH="/app/.venv/bin:${PATH}"
+RUN bash docreader/scripts/generate_proto.sh
+
+FROM python:3.10.18-bookworm AS runner
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libjpeg62-turbo libgl1 libglib2.0-0 antiword curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ENV VIRTUAL_ENV=/app/.venv
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /usr/local/bin/protoc /usr/local/bin/protoc
+ENV PATH="/app/.venv/bin:${PATH}"
+COPY --from=builder /app/docreader /app/docreader
+RUN mkdir -p /tmp/docreader
+EXPOSE 50051
+ENTRYPOINT ["/app/.venv/bin/python", "-m", "docreader.container_entrypoint"]
+CMD ["/app/.venv/bin/python", "-m", "docreader.main"]
