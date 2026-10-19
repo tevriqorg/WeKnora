@@ -28,6 +28,21 @@ jobs:
         run: |
           set -euo pipefail
           python3 tests/aibox_issue123_p2/prepare_fixtures.py --root "$RUNNER_TEMP/aibox-issue123"
+      - name: Run P2 ingress bounded-stream and recovery regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tests/aibox_issue123_p2/p2_source/tests/g1:$PWD/tests/aibox_issue123_p2/p2_source"
+          for case in \
+            test_file_streaming_does_not_call_path_read_bytes \
+            test_archive_target_rejects_escape_and_does_not_write_outside \
+            test_durable_staging_survives_restart \
+            test_commit_ack_uncertainty_recognizes_matching_final \
+            test_wrong_existing_final_fails_closed \
+            test_storage_commit_rejects_corrupt_staging \
+            test_recover_commit_after_conflicting_final_is_cleared_without_fake_handoff; do
+            python3 -m unittest "test_ingress.IngressContractTest.$case"
+          done
       - name: Run exact P2-to-WeKnora and virtual mailbox acceptance tests
         shell: bash
         run: |
