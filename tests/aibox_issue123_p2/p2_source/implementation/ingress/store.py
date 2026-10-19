@@ -19,12 +19,13 @@ class IngressError(RuntimeError):
 STATES = {
     "discovered", "acquiring", "staged", "analyzing", "analyzed",
     "committing", "committed", "handoff_pending", "complete",
-    "committed_analysis_pending",
+    "committed_analysis_pending", "staging",
 }
 
 TRANSITIONS = {
     "discovered": {"acquiring"},
-    "acquiring": {"staged"},
+    "acquiring": {"staged", "staging"},
+    "staging": {"staged"},
     "staged": {"analyzing", "committing"},
     "analyzing": {"analyzed", "committing"},
     "analyzed": {"committing"},
@@ -69,6 +70,7 @@ class IngressStore:
               analysis_status TEXT NOT NULL DEFAULT 'pending',
               analysis_manifest_ref TEXT NOT NULL DEFAULT '', target_policy TEXT NOT NULL DEFAULT '',
               final_resource_ref TEXT NOT NULL DEFAULT '', commit_mode TEXT NOT NULL DEFAULT '',
+              staging_token TEXT NOT NULL DEFAULT '',
               handoff_status TEXT NOT NULL DEFAULT 'pending',
               state TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '',
               retry_metadata TEXT NOT NULL DEFAULT '{}', updated_at REAL NOT NULL
@@ -79,6 +81,8 @@ class IngressStore:
             columns = {row[1] for row in con.execute("PRAGMA table_info(ingest_sessions)")}
             if "commit_mode" not in columns:
                 con.execute("ALTER TABLE ingest_sessions ADD COLUMN commit_mode TEXT NOT NULL DEFAULT ''")
+            if "staging_token" not in columns:
+                con.execute("ALTER TABLE ingest_sessions ADD COLUMN staging_token TEXT NOT NULL DEFAULT ''")
 
     def get(self, ingest_id: str) -> dict[str, Any]:
         with self._connect() as con:
@@ -181,42 +185,51 @@ class IngressStore:
         return self.get(ingest_id)
 
     def stage_file(self, ingest_id: str, source: str | Path, chunk_size: int = 1024 * 1024) -> dict[str, Any]:
-        """Stream into one durable .part under a serialized SQLite write lock."""
+        """Claim briefly, stream outside SQLite's global writer lock, then CAS the ack."""
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
         source = Path(source)
         if not source.is_file():
             raise IngressError("source file is unavailable")
-        session = self.get(ingest_id)
-        if session["state"] not in {"discovered", "acquiring"}:
-            raise IngressError("stage_file requires discovered or acquiring state")
         staging = self.staging_root / f"{ingest_id}.part"
         if staging.exists() and os.path.samefile(source, staging):
             raise IngressError("source file aliases its staging target")
+        token = uuid.uuid4().hex
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT state FROM ingest_sessions WHERE ingest_id=?", (ingest_id,)).fetchone()
+            if not row:
+                raise IngressError(f"unknown ingest_id: {ingest_id}")
+            if row["state"] not in {"discovered", "acquiring"}:
+                raise IngressError("stage_file requires an unclaimed discovered/acquiring session")
+            cur = con.execute("UPDATE ingest_sessions SET state='staging', staging_token=?, updated_at=? WHERE ingest_id=? AND state=?", (token, time.time(), ingest_id, row["state"]))
+            if cur.rowcount != 1:
+                raise IngressError("staging claim lost a concurrent state change")
         fd, tmp_name = tempfile.mkstemp(prefix=f".{ingest_id}.stage-", dir=self.staging_root)
         tmp = Path(tmp_name)
+        installed = False
         try:
+            digest, size = hashlib.sha256(), 0
+            with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
+                fd = -1
+                while chunk := src.read(chunk_size):
+                    dst.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+            os.replace(tmp, staging)
+            installed = True
+            self._fsync_directory(self.staging_root)
             with self._connect() as con:
-                con.execute("BEGIN IMMEDIATE")
-                row = con.execute("SELECT state FROM ingest_sessions WHERE ingest_id=?", (ingest_id,)).fetchone()
-                if not row or row["state"] not in {"discovered", "acquiring"}:
-                    raise IngressError("stage_file requires an unclaimed acquiring session")
-                if row["state"] == "discovered":
-                    con.execute("UPDATE ingest_sessions SET state='acquiring', updated_at=? WHERE ingest_id=? AND state='discovered'", (time.time(), ingest_id))
-                digest, size = hashlib.sha256(), 0
-                with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
-                    fd = -1
-                    while chunk := src.read(chunk_size):
-                        dst.write(chunk)
-                        digest.update(chunk)
-                        size += len(chunk)
-                    dst.flush()
-                    os.fsync(dst.fileno())
-                os.replace(tmp, staging)
-                self._fsync_directory(self.staging_root)
-                cur = con.execute("UPDATE ingest_sessions SET state='staged', staging_ref=?, content_hash=?, size=?, last_error='', updated_at=? WHERE ingest_id=? AND state IN ('discovered','acquiring')", (str(staging), digest.hexdigest(), size, time.time(), ingest_id))
+                cur = con.execute("UPDATE ingest_sessions SET state='staged', staging_token='', staging_ref=?, content_hash=?, size=?, last_error='', updated_at=? WHERE ingest_id=? AND state='staging' AND staging_token=?", (str(staging), digest.hexdigest(), size, time.time(), ingest_id, token))
                 if cur.rowcount != 1:
-                    raise IngressError("staging acknowledgement lost a concurrent state change")
+                    raise IngressError("staging acknowledgement lost its ownership token")
+        except BaseException:
+            if not installed:
+                with self._connect() as con:
+                    con.execute("UPDATE ingest_sessions SET state='acquiring', staging_token='', updated_at=? WHERE ingest_id=? AND state='staging' AND staging_token=?", (time.time(), ingest_id, token))
+            raise
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -233,7 +246,7 @@ class IngressStore:
                 raise IngressError(f"unknown ingest_id: {ingest_id}")
             if row["state"] == "staged":
                 return self.get(ingest_id)
-            if row["state"] not in {"discovered", "acquiring"} or not staging.is_file():
+            if row["state"] not in {"discovered", "acquiring", "staging"} or not staging.is_file():
                 raise IngressError("no recoverable durable staging object")
             digest, size = hashlib.sha256(), 0
             with staging.open("rb") as stream:
@@ -242,7 +255,7 @@ class IngressStore:
                     size += len(chunk)
                 os.fsync(stream.fileno())
             self._fsync_directory(self.staging_root)
-            cur = con.execute("UPDATE ingest_sessions SET state='staged', staging_ref=?, content_hash=?, size=?, last_error='', updated_at=? WHERE ingest_id=? AND state IN ('discovered','acquiring')", (str(staging), digest.hexdigest(), size, time.time(), ingest_id))
+            cur = con.execute("UPDATE ingest_sessions SET state='staged', staging_token='', staging_ref=?, content_hash=?, size=?, last_error='', updated_at=? WHERE ingest_id=? AND state IN ('discovered','acquiring','staging')", (str(staging), digest.hexdigest(), size, time.time(), ingest_id))
             if cur.rowcount != 1:
                 raise IngressError("staging recovery lost a concurrent state change")
         return self.get(ingest_id)
@@ -299,7 +312,11 @@ class IngressStore:
             os.close(fd)
             tmp = Path(tmp_name)
             try:
-                shutil.copyfile(staging, tmp)
+                with staging.open("rb") as src, tmp.open("wb") as dst:
+                    while chunk := src.read(1024 * 1024):
+                        dst.write(chunk)
+                    dst.flush()
+                    os.fsync(dst.fileno())
                 if not self._verify(tmp, session["content_hash"], session["size"]):
                     raise IngressError("final object failed size/hash verification")
                 os.replace(tmp, final)
