@@ -83,3 +83,5 @@ jobs:
           fi
           mv "$backup" "$receipt"
           python3 tests/aibox_issue123_p2/finalize_fixtures.py --root "$RUNNER_TEMP/aibox-issue123"
+          # Replaying after a completed handoff must be safe and leave no staging.
+          python3 tests/aibox_issue123_p2/finalize_fixtures.py --root "$RUNNER_TEMP/aibox-issue123"

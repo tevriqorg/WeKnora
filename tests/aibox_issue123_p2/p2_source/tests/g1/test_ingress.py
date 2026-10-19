@@ -225,7 +225,13 @@ class IngressContractTest(unittest.TestCase):
         final.write_bytes(b"collision")
         with self.assertRaises(IngressError):
             self.store.commit(session["ingest_id"], "camera/clip.mp4")
-        self.assertEqual("committing", self.store.get(session["ingest_id"])["state"])
+        committing = self.store.get(session["ingest_id"])
+        self.assertEqual("committing", committing["state"])
+        self.assertEqual(final.as_uri(), committing["final_resource_ref"])
+        self.assertEqual(b"collision", final.read_bytes())
+        with self.assertRaisesRegex(IngressError, "originally selected archive target"):
+            self.store.commit(session["ingest_id"], "camera/alternate.mp4")
+        self.assertFalse((self.store.final_root / "camera" / "alternate.mp4").exists())
         self.assertEqual(b"collision", final.read_bytes())
         final.unlink()
         committed = self.store.commit(session["ingest_id"], "camera/clip.mp4")

@@ -209,7 +209,17 @@ class IngressStore:
         if not final.resolve().is_relative_to(self.final_root.resolve()):
             raise IngressError("final target escapes archive root")
         final.parent.mkdir(parents=True, exist_ok=True)
-        self._transition(ingest_id, "committing")
+        final_uri = final.as_uri()
+        if session["state"] == "committing":
+            if not session["final_resource_ref"]:
+                raise IngressError("committing session has no recorded archive target")
+            if session["final_resource_ref"] != final_uri:
+                raise IngressError("commit retry must use the originally selected archive target")
+        else:
+            # Persist the archive choice before installing the final object. A
+            # crash in the committing state must not allow a retry to create a
+            # second authoritative Raw at a different name.
+            self._transition(ingest_id, "committing", final_resource_ref=final_uri)
         if final.exists():
             if not self._verify(final, session["content_hash"], session["size"]):
                 raise IngressError("existing final object does not match staged source")
@@ -226,7 +236,7 @@ class IngressStore:
                 tmp.unlink(missing_ok=True)
         state = "committed_analysis_pending" if preservation_bypass else "committed"
         status = "pending" if preservation_bypass else session["analysis_status"]
-        self._transition(ingest_id, state, final_resource_ref=final.as_uri(),
+        self._transition(ingest_id, state, final_resource_ref=final_uri,
                          analysis_status=status, last_error="")
         return self.get(ingest_id)
 

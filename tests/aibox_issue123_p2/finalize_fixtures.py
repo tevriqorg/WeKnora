@@ -44,14 +44,18 @@ def finalize(root: Path) -> None:
 
     store = IngressStore(root / "7" / "transit")
     for item in expected:
-        session = store.get(item["ingest_id"])
-        if session["state"] != "handoff_pending":
+        ingest_id = item["ingest_id"]
+        session = store.get(ingest_id)
+        if session["state"] not in {"handoff_pending", "complete"}:
             raise RuntimeError(f"unexpected pre-handoff state: {session['state']}")
-        if not store.can_cleanup_staging(item["ingest_id"]):
-            raise RuntimeError(f"final resource is not verified: {item['ingest_id']}")
-        store.complete_handoff(item["ingest_id"])
-        store.cleanup_staging(item["ingest_id"])
-        completed = store.get(item["ingest_id"])
+        if not store.can_cleanup_staging(ingest_id):
+            raise RuntimeError(f"final resource is not verified: {ingest_id}")
+        if session["state"] == "handoff_pending":
+            store.complete_handoff(ingest_id)
+        # "complete" can be durable before staging cleanup. Accept it on replay
+        # and let cleanup_staging finish the interrupted finalization.
+        store.cleanup_staging(ingest_id)
+        completed = store.get(ingest_id)
         if completed["state"] != "complete" or completed["staging_ref"]:
             raise RuntimeError(f"handoff recovery did not clean staging: {item['ingest_id']}")
         if Path(item["staging_path"]).exists():
