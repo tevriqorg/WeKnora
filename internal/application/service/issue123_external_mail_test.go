@@ -1,0 +1,231 @@
+// Copied into the exact-pinned WeKnora internal/application/service package by CI.
+// These tests call real WeKnora resource and datasource code, not a second Python
+// reproduction. All files live in t.TempDir(); there is no NAS/mail connection.
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	appfile "github.com/Tencent/WeKnora/internal/application/service/file"
+	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/stretchr/testify/require"
+)
+
+func TestIssue123ThreeExistingExternalFilesNeverCopiedOrDeleted(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	catalog, _ := newResourceCatalogForTest(t)
+	fileService := appfile.NewResourceCatalogFileService(appfile.NewLocalFileService(root, ""), catalog)
+	writer := newDerivedWriterFixture()
+	revisions := &derivedRevisionFixture{}
+	derived := newDerivedKnowledgeEnvelopeService(writer, revisions)
+	for n := 1; n <= 3; n++ {
+		relative := fmt.Sprintf("7/archived/%d.md", n)
+		absolute := filepath.Join(root, relative)
+		require.NoError(t, os.MkdirAll(filepath.Dir(absolute), 0755))
+		body := []byte(fmt.Sprintf("archived-%d-original", n))
+		require.NoError(t, os.WriteFile(absolute, body, 0644))
+		physical := "local://" + relative
+		ref, err := catalog.Register(ctx, 7, physical, interfaces.ResourceRegistration{
+			Kind: "file", Ownership: types.ResourceOwnershipExternal,
+			OriginalName: filepath.Base(relative), Size: int64(len(body)),
+		})
+		require.NoError(t, err)
+		same, err := catalog.Register(ctx, 7, physical, interfaces.ResourceRegistration{
+			Ownership: types.ResourceOwnershipExternal,
+		})
+		require.NoError(t, err)
+		require.Equal(t, ref, same)
+		require.NoError(t, catalog.Bind(ctx, ref, types.ResourceOwnerKnowledge,
+			fmt.Sprintf("external-%d", n), types.ResourceRelationSourceFile))
+		data, err := fileService.GetFile(ctx, ref)
+		require.NoError(t, err)
+		got, err := io.ReadAll(data)
+		require.NoError(t, err)
+		require.NoError(t, data.Close())
+		require.Equal(t, body, got)
+		env := &types.DerivedKnowledgeEnvelope{
+			SourceKey: fmt.Sprintf("mockqnap:%d", n), SourceRevisionID: "v1",
+			DerivedObjectID: fmt.Sprintf("asset-%d", n), Title: fmt.Sprintf("existing-%d", n),
+			Markdown: string(body), SourceResourceRef: ref,
+			SourceLocators: types.SourceLocators{{Type: types.SourceLocatorText, SourceID: fmt.Sprintf("asset-%d", n)}},
+			Processor:      "mock-fixture", ProcessorVersion: "v1",
+			Capabilities: []string{"metadata"}, AnalysisStatus: "ready", ProducedAt: time.Now().UTC(),
+		}
+		knowledge, err := derived.Upsert(types.WithExecutionTenant(ctx, 7), "kb-1", env)
+		require.NoError(t, err)
+		require.NotEmpty(t, knowledge.ID)
+		replay, err := derived.Upsert(types.WithExecutionTenant(ctx, 7), "kb-1", env)
+		require.NoError(t, err)
+		require.Equal(t, knowledge.ID, replay.ID)
+		remaining, err := catalog.Release(ctx, ref, types.ResourceOwnerKnowledge, fmt.Sprintf("external-%d", n))
+		require.NoError(t, err)
+		require.Positive(t, remaining, "external raw must never become eligible for managed delete")
+		require.NoError(t, fileService.DeleteFile(ctx, ref))
+		after, err := os.ReadFile(absolute)
+		require.NoError(t, err)
+		require.Equal(t, body, after)
+	}
+	files := 0
+	require.NoError(t, filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			files++
+		}
+		return nil
+	}))
+	require.Equal(t, 3, files, "WeKnora derived ingestion must not persist duplicate RAW files")
+}
+
+// The mailbox is a deterministic 1..6 test-only feed; it is deliberately NOT a
+// new live Mail Hub connector. The test exercises actual DataSourceService
+// stable-identity decisions and existing cursor helper, not a copied algorithm.
+type issue123MailRepository struct {
+	interfaces.KnowledgeRepository
+	rows map[string]*types.Knowledge
+}
+
+func (r *issue123MailRepository) FindByDataSourceExternalID(
+	_ context.Context, _ uint64, _, datasourceID, externalID string,
+) (*types.Knowledge, error) {
+	for _, k := range r.rows {
+		meta := k.GetMetadata()
+		if meta["datasource_id"] == datasourceID && meta["external_id"] == externalID {
+			return k, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *issue123MailRepository) UpdateKnowledgeColumn(
+	_ context.Context, id string, column string, value interface{},
+) error {
+	k := r.rows[id]
+	if k == nil {
+		return fmt.Errorf("unknown knowledge %s", id)
+	}
+	if column == "metadata" {
+		if data, ok := value.(types.JSON); ok {
+			k.Metadata = data
+		}
+	}
+	return nil
+}
+
+func (r *issue123MailRepository) UpdateKnowledgeColumns(
+	_ context.Context, id string, values map[string]interface{},
+) error {
+	k := r.rows[id]
+	if k == nil {
+		return fmt.Errorf("unknown knowledge %s", id)
+	}
+	if data, ok := values["metadata"].(types.JSON); ok {
+		k.Metadata = data
+	}
+	if name, ok := values["file_name"].(string); ok {
+		k.FileName = name
+	}
+	if title, ok := values["title"].(string); ok {
+		k.Title = title
+	}
+	return nil
+}
+
+type issue123MailKnowledge struct {
+	interfaces.KnowledgeService
+	repo              *issue123MailRepository
+	created, replaced int
+}
+
+func (k *issue123MailKnowledge) GetRepository() interfaces.KnowledgeRepository { return k.repo }
+
+func (k *issue123MailKnowledge) CreateKnowledgeFromURL(
+	_ context.Context, _ string, url, fileName, _ string,
+	_ *bool, title string, _ []string, _ string,
+	_ *types.KnowledgeProcessOverrides,
+) (*types.Knowledge, error) {
+	k.created++
+	kn := &types.Knowledge{ID: fmt.Sprintf("mail-knowledge-%d", k.created),
+		FileName: fileName, Title: title, Source: url, Type: "url"}
+	k.repo.rows[kn.ID] = kn
+	return kn, nil
+}
+
+func (k *issue123MailKnowledge) ReplaceKnowledgeURL(
+	_ context.Context, id, url, fileName, title string, metadata map[string]string,
+) (*types.Knowledge, error) {
+	k.replaced++
+	kn := k.repo.rows[id]
+	kn.Source, kn.FileName, kn.Title = url, fileName, title
+	raw, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+	kn.Metadata = types.JSON(raw)
+	return kn, nil
+}
+
+func TestIssue123VirtualMailboxBackfillThenIncremental(t *testing.T) {
+	repo := &issue123MailRepository{rows: make(map[string]*types.Knowledge)}
+	knowledge := &issue123MailKnowledge{repo: repo}
+	ds := &types.DataSource{ID: "virtual-mail", Type: "mockmail",
+		TenantID: 7, KnowledgeBaseID: "kb-1"}
+	service := &DataSourceService{knowledgeService: knowledge}
+	ctx := context.Background()
+	push := func(seq int, version string) {
+		item := &types.FetchedItem{
+			ExternalID: fmt.Sprintf("message-%d", seq),
+			Title:      fmt.Sprintf("Virtual email %d", seq),
+			FileName:   fmt.Sprintf("mail-%d.md", seq),
+			URL:        fmt.Sprintf("https://mail.invalid/message/%d", seq),
+			Metadata:   map[string]string{"native_version": version},
+		}
+		_, err := service.ingestItem(ctx, ds, item, nil)
+		require.NoError(t, err)
+	}
+	for n := 1; n <= 3; n++ {
+		push(n, "v1")
+	}
+	require.Equal(t, 3, knowledge.created)
+	before := map[string]string{}
+	for id, kn := range repo.rows {
+		before[kn.GetMetadata()["external_id"]] = id
+	}
+	// Simulates a connector checkpoint after email 3 and incremental iteration.
+	cursor := &types.SyncCursor{ConnectorCursor: map[string]interface{}{"last_message": float64(3)}}
+	raw, err := json.Marshal(cursor)
+	require.NoError(t, err)
+	ds.LastSyncCursor = types.JSON(raw)
+	next, err := streamStartCursor(ds, false, 0)
+	require.NoError(t, err)
+	require.Equal(t, float64(3), next.ConnectorCursor["last_message"])
+	for n := 4; n <= 6; n++ {
+		push(n, "v1")
+	}
+	require.Equal(t, 6, knowledge.created)
+	require.Len(t, repo.rows, 6)
+	for n := 4; n <= 6; n++ {
+		push(n, "v1")
+	}
+	require.Equal(t, 6, knowledge.created, "replay must not make a seventh knowledge")
+	require.Equal(t, 0, knowledge.replaced)
+	push(2, "v2")
+	require.Equal(t, 6, knowledge.created)
+	require.Equal(t, 1, knowledge.replaced)
+	for externalID, originalID := range before {
+		kn, err := repo.FindByDataSourceExternalID(ctx, 7, "kb-1", "virtual-mail", externalID)
+		require.NoError(t, err)
+		require.NotNil(t, kn)
+		require.Equal(t, originalID, kn.ID, "mail revision must preserve Knowledge identity")
+	}
+}
