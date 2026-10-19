@@ -15,9 +15,12 @@ import (
 	"testing"
 	"time"
 
+	apprepo "github.com/Tencent/WeKnora/internal/application/repository"
 	appfile "github.com/Tencent/WeKnora/internal/application/service/file"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/hibiken/asynq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -87,6 +90,70 @@ func TestIssue123ThreeExistingExternalFilesNeverCopiedOrDeleted(t *testing.T) {
 		return nil
 	}))
 	require.Equal(t, 3, files, "WeKnora derived ingestion must not persist duplicate RAW files")
+}
+
+// Unlike the fast fixture above, this executes real WeKnora repository writes
+// (Knowledge + SourceRevision) through the actual derived ingestion service.
+// No FileService.SaveFile is invoked: the source remains externally owned.
+func TestIssue123ExternalRawActualKnowledgeDatabaseHandoff(t *testing.T) {
+	mini := miniredis.RunT(t)
+	client := asynq.NewClient(asynq.RedisClientOpt{Addr: mini.Addr()})
+	defer client.Close()
+	fixture := newDocumentWriteFixture(t)
+	fixture.svc.kbService = &g2OrdinaryDocKBService{kb: fixture.kbs.values["kb"]}
+	fixture.svc.task = client
+	require.NoError(t, fixture.db.AutoMigrate(
+		&types.SourceRevision{}, &types.StoredResource{}, &types.ResourceBinding{}, &types.ResourceAccessGrant{},
+	))
+	catalog := NewResourceCatalog(apprepo.NewResourceRepository(fixture.db))
+	concreteRepo := apprepo.NewKnowledgeRepository(fixture.db)
+	revisionStore, ok := any(concreteRepo).(derivedSourceRevisionStore)
+	require.True(t, ok)
+	derived := newDerivedKnowledgeEnvelopeService(fixture.svc, revisionStore)
+	root := t.TempDir()
+	for n := 1; n <= 3; n++ {
+		raw := []byte(fmt.Sprintf("QNAP archived original %d", n))
+		physical := fmt.Sprintf("local://7/qnap/%d.md", n)
+		path := filepath.Join(root, "7", "qnap", fmt.Sprintf("%d.md", n))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0755))
+		require.NoError(t, os.WriteFile(path, raw, 0644))
+		ref, err := catalog.Register(fixture.ctx, 7, physical, interfaces.ResourceRegistration{
+			Ownership: types.ResourceOwnershipExternal, OriginalName: fmt.Sprintf("%d.md", n),
+		})
+		require.NoError(t, err)
+		env := &types.DerivedKnowledgeEnvelope{
+			SourceKey: fmt.Sprintf("qnap:fixture:%d", n), SourceRevisionID: "sha256-fixture-v1",
+			DerivedObjectID: fmt.Sprintf("file-%d", n), Title: fmt.Sprintf("%d.md", n),
+			Markdown: string(raw), SourceResourceRef: ref,
+			SourceLocators: types.SourceLocators{{Type: types.SourceLocatorText, SourceID: fmt.Sprintf("file-%d", n)}},
+			Processor:      "mock-atrest", ProcessorVersion: "1",
+			Capabilities: []string{"metadata"}, AnalysisStatus: "ready", ProducedAt: time.Now().UTC(),
+		}
+		knowledge, err := derived.Upsert(fixture.ctx, "kb", env)
+		require.NoError(t, err)
+		require.NotEmpty(t, knowledge.ID)
+		stored, err := fixture.repo.GetKnowledgeByID(fixture.ctx, 7, knowledge.ID)
+		require.NoError(t, err)
+		require.Empty(t, stored.FilePath, "derived Knowledge must never store original Raw through SaveFile")
+		require.Equal(t, types.KnowledgeTypeManual, stored.Type)
+		var revision types.SourceRevision
+		require.NoError(t, fixture.db.First(&revision, "knowledge_id = ?", knowledge.ID).Error)
+		require.Equal(t, ref, revision.ResourceRef)
+		after, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Equal(t, raw, after)
+	}
+	count := 0
+	require.NoError(t, filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			count++
+		}
+		return nil
+	}))
+	require.Equal(t, 3, count)
 }
 
 // When WeKnora's Local Storage is mapped to the archive location, the
