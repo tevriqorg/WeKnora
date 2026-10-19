@@ -35,9 +35,9 @@ func TestIssue123ThreeExistingExternalFilesNeverCopiedOrDeleted(t *testing.T) {
 	for n := 1; n <= 3; n++ {
 		relative := fmt.Sprintf("7/archived/%d.md", n)
 		absolute := filepath.Join(root, relative)
-		require.NoError(t, os.MkdirAll(filepath.Dir(absolute), 0755))
+		require.NoError(t, os.MkdirAll(filepath.Dir(absolute), 0o755))
 		body := []byte(fmt.Sprintf("archived-%d-original", n))
-		require.NoError(t, os.WriteFile(absolute, body, 0644))
+		require.NoError(t, os.WriteFile(absolute, body, 0o644))
 		physical := "local://" + relative
 		ref, err := catalog.Register(ctx, 7, physical, interfaces.ResourceRegistration{
 			Kind: "file", Ownership: types.ResourceOwnershipExternal,
@@ -80,7 +80,7 @@ func TestIssue123ThreeExistingExternalFilesNeverCopiedOrDeleted(t *testing.T) {
 		require.Equal(t, body, after)
 	}
 	files := 0
-	require.NoError(t, filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+	require.NoError(t, filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -98,7 +98,7 @@ func TestIssue123ThreeExistingExternalFilesNeverCopiedOrDeleted(t *testing.T) {
 func TestIssue123ExternalRawActualKnowledgeDatabaseHandoff(t *testing.T) {
 	mini := miniredis.RunT(t)
 	client := asynq.NewClient(asynq.RedisClientOpt{Addr: mini.Addr()})
-	defer client.Close()
+	defer func() { require.NoError(t, client.Close()) }()
 	fixture := newDocumentWriteFixture(t)
 	fixture.svc.kbService = &g2OrdinaryDocKBService{kb: fixture.kbs.values["kb"]}
 	fixture.svc.task = client
@@ -115,8 +115,8 @@ func TestIssue123ExternalRawActualKnowledgeDatabaseHandoff(t *testing.T) {
 		raw := []byte(fmt.Sprintf("QNAP archived original %d", n))
 		physical := fmt.Sprintf("local://7/qnap/%d.md", n)
 		path := filepath.Join(root, "7", "qnap", fmt.Sprintf("%d.md", n))
-		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0755))
-		require.NoError(t, os.WriteFile(path, raw, 0644))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, raw, 0o644))
 		ref, err := catalog.Register(fixture.ctx, 7, physical, interfaces.ResourceRegistration{
 			Ownership: types.ResourceOwnershipExternal, OriginalName: fmt.Sprintf("%d.md", n),
 		})
@@ -171,7 +171,7 @@ func TestIssue123NewUploadGoesDirectlyToConfiguredArchiveRoot(t *testing.T) {
 	require.NoError(t, writer.Close())
 	form, err := multipart.NewReader(&buf, writer.Boundary()).ReadForm(1024 * 1024)
 	require.NoError(t, err)
-	defer form.RemoveAll()
+	defer func() { require.NoError(t, form.RemoveAll()) }()
 	f := form.File["file"][0]
 	stored, err := svc.SaveFile(ctx, f, 7, "new-4")
 	require.NoError(t, err)
