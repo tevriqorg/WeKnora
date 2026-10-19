@@ -6,7 +6,8 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+P2_SOURCE_ROOT = Path(__file__).resolve().parent / "p2_source"
+sys.path.insert(0, str(P2_SOURCE_ROOT))
 
 from implementation.ingress.store import IngressStore
 
