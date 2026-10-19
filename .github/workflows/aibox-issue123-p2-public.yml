@@ -32,8 +32,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp tests/aibox_issue123_p2/p2_raw_once_integration_test.go \
+          cp tests/aibox_issue123_p2/p2_raw_once_integration_test.go.in \
             internal/application/service/p2_raw_once_integration_test.go
+          gofmt -w internal/application/service/p2_raw_once_integration_test.go
           AIBOX_ISSUE123_FIXTURE_ROOT="$RUNNER_TEMP/aibox-issue123" \
             go test -count=1 -v ./internal/application/service \
             -run '^TestIssue123P2(AtRestAndTransitFilesHandOffToWeKnora|VirtualMailboxConnectorFetchesByCursor)$'
