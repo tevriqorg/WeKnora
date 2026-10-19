@@ -48,6 +48,10 @@ jobs:
               "test_storage_commit_rejects_corrupt_staging",
               "test_recover_commit_after_conflicting_final_is_cleared_without_fake_handoff",
               "test_concurrent_commit_workers_claim_only_one_archive_target",
+              "test_recover_durable_part_after_pre_ack_crash",
+              "test_concurrent_stage_workers_serialize_shared_part",
+              "test_commit_retry_cannot_change_claimed_mode",
+              "test_nested_archive_directory_ancestors_are_fsynced",
           ]
           suite = unittest.TestSuite(test_ingress.IngressContractTest(name) for name in names)
           result = unittest.TextTestRunner(verbosity=2).run(suite)
