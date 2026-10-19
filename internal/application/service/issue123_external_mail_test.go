@@ -263,8 +263,13 @@ func (k *issue123MailKnowledge) CreateKnowledgeFromURL(
 	_ *types.KnowledgeProcessOverrides,
 ) (*types.Knowledge, error) {
 	k.created++
-	kn := &types.Knowledge{ID: fmt.Sprintf("mail-knowledge-%d", k.created),
-		FileName: fileName, Title: title, Source: url, Type: "url"}
+	kn := &types.Knowledge{
+		ID:       fmt.Sprintf("mail-knowledge-%d", k.created),
+		FileName: fileName,
+		Title:    title,
+		Source:   url,
+		Type:     "url",
+	}
 	k.repo.rows[kn.ID] = kn
 	return kn, nil
 }
@@ -286,8 +291,12 @@ func (k *issue123MailKnowledge) ReplaceKnowledgeURL(
 func TestIssue123VirtualMailboxBackfillThenIncremental(t *testing.T) {
 	repo := &issue123MailRepository{rows: make(map[string]*types.Knowledge)}
 	knowledge := &issue123MailKnowledge{repo: repo}
-	ds := &types.DataSource{ID: "virtual-mail", Type: "mockmail",
-		TenantID: 7, KnowledgeBaseID: "kb-1"}
+	ds := &types.DataSource{
+		ID:              "virtual-mail",
+		Type:            "mockmail",
+		TenantID:        7,
+		KnowledgeBaseID: "kb-1",
+	}
 	service := &DataSourceService{knowledgeService: knowledge}
 	ctx := context.Background()
 	push := func(seq int, version string) {
