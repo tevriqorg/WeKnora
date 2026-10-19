@@ -34,7 +34,7 @@ jobs:
           set -euo pipefail
           export PYTHONPATH="$PWD/tests/aibox_issue123_p2/p2_source/tests/g1:$PWD/tests/aibox_issue123_p2/p2_source"
           for case in \
-            test_file_streaming_does_not_call_path_read_bytes \\
+            test_file_streaming_does_not_call_path_read_bytes \
             test_stage_file_rejects_hardlink_alias_without_destroying_source \\
             test_archive_target_rejects_escape_and_does_not_write_outside \
             test_durable_staging_survives_restart \
