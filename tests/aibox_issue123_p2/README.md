@@ -11,6 +11,6 @@ By ChatGPT
 
 ## Additional P2 G1 acceptance gate
 
-The public Actions job also runs the P2-sourced bounded-stream, source-alias protection, path-safety, durable-staging, and commit-recovery test cases from the isolated Python fixture. It intentionally excludes state-machine unit cases that manually set handoff success; actual WeKnora handoff remains receipt-gated by the Go integration test above.
+The public Actions job also runs the P2-sourced bounded-stream read-size enforcement, source-alias protection, path-safety, durable-staging, and commit-recovery test cases from the isolated Python fixture. It intentionally excludes state-machine unit cases that manually set handoff success; actual WeKnora handoff remains receipt-gated by the Go integration test above.
 
-P2 test snapshot: branch `feature/issue-123-raw-once`, commit `f6b40dff20dd55cd2f9f2533838fa97fe46ca80a`.. The virtual mailbox connector test source matches this UAT branch's Go template blob `ca2712a3aa02940d59682704d1503b7666c7737d`.
+P2 test snapshot: branch `feature/issue-123-raw-once`, commit `3afa817d6e6d9769283fc6665325a98905bf43e1`.. The virtual mailbox connector test source matches this UAT branch's Go template blob `ca2712a3aa02940d59682704d1503b7666c7737d`.

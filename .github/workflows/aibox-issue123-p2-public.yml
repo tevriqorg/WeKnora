@@ -39,7 +39,7 @@ jobs:
           sys.path.insert(0, "tests/aibox_issue123_p2/p2_source/tests/g1")
           import test_ingress
           names = [
-              "test_file_streaming_does_not_call_path_read_bytes",
+              "test_file_streaming_rejects_unbounded_and_oversized_reads",
               "test_stage_file_rejects_hardlink_alias_without_destroying_source",
               "test_archive_target_rejects_escape_and_does_not_write_outside",
               "test_durable_staging_survives_restart",

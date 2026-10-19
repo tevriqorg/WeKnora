@@ -75,18 +75,50 @@ class IngressContractTest(unittest.TestCase):
         self.store.cleanup_staging(session["ingest_id"])
         self.assertEqual([], list(self.store.staging_root.iterdir()))
 
-    def test_file_streaming_does_not_call_path_read_bytes(self):
+    def test_file_streaming_rejects_unbounded_and_oversized_reads(self):
+        import builtins
         from unittest.mock import patch
+
         source = self.root / "source.mp4"
-        source.write_bytes(b"x" * 1024 * 1024)
+        source.write_bytes(b"x" * (4 * 1024 * 1024))
         session = self.new_session()
-        with patch.object(Path, "read_bytes", side_effect=AssertionError("whole-file read forbidden")):
+        max_read = 1024 * 1024
+        original_open = builtins.open
+        original_path_open = Path.open
+
+        class GuardedReader:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def read(self, size=-1, *args, **kwargs):
+                if size is None or size < 0 or size > max_read:
+                    raise AssertionError(f"unbounded/oversized read request: {size}")
+                return self.stream.read(size, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+        def guarded_builtin(file, mode="r", *args, **kwargs):
+            stream = original_open(file, mode, *args, **kwargs)
+            return GuardedReader(stream) if "r" in mode else stream
+
+        def guarded_path(path, mode="r", *args, **kwargs):
+            stream = original_path_open(path, mode, *args, **kwargs)
+            return GuardedReader(stream) if "r" in mode else stream
+
+        with patch("builtins.open", side_effect=guarded_builtin), patch.object(Path, "open", guarded_path):
             self.store.stage_file(session["ingest_id"], source, chunk_size=32768)
             self.store.begin_analysis(session["ingest_id"])
             self.store.mark_analyzed(session["ingest_id"], "manifest://data")
             committed = self.store.commit(session["ingest_id"], "safe/file.mp4")
             self.assertEqual("committed", committed["state"])
-            self.store.cleanup_staging(session["ingest_id"])
 
     def test_archive_target_rejects_escape_and_does_not_write_outside(self):
         session = self.analyzed()

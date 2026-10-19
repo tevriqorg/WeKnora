@@ -1,3 +1,3 @@
-P2-AIBOX feature/issue-123-raw-once source snapshot:
-- latest P2 head after review fixes: f6b40dff20dd55cd2f9f2533838fa97fe46ca80a
-- source alias-safe streaming, recovery tests, receipt binding and actual cursor-connector integration included.
+P2-AIBOX feature/issue-123-raw-once current tested source commits:
+- latest P2 branch source/test head: 3afa817d6e6d9769283fc6665325a98905bf43e1
+- includes alias-safe staging, receipt binding, cursor connector, and bounded read-size regression coverage.
