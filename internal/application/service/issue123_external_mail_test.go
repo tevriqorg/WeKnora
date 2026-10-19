@@ -4,10 +4,12 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"os"
 	"path/filepath"
 	"testing"
@@ -85,6 +87,45 @@ func TestIssue123ThreeExistingExternalFilesNeverCopiedOrDeleted(t *testing.T) {
 		return nil
 	}))
 	require.Equal(t, 3, files, "WeKnora derived ingestion must not persist duplicate RAW files")
+}
+
+// When WeKnora's Local Storage is mapped to the archive location, the
+// provider writes the one durable managed copy there, not to a second location.
+func TestIssue123NewUploadGoesDirectlyToConfiguredArchiveRoot(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir() // mock QNAP mount, no real NAS
+	svc := appfile.NewLocalFileService(root, "")
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", "4.md")
+	require.NoError(t, err)
+	_, err = part.Write([]byte("new-4-original"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	form, err := multipart.NewReader(&buf, writer.Boundary()).ReadForm(1024 * 1024)
+	require.NoError(t, err)
+	defer form.RemoveAll()
+	f := form.File["file"][0]
+	stored, err := svc.SaveFile(ctx, f, 7, "new-4")
+	require.NoError(t, err)
+	require.Contains(t, stored, "local://7/new-4/")
+	reader, err := svc.GetFile(ctx, stored)
+	require.NoError(t, err)
+	content, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	require.Equal(t, "new-4-original", string(content))
+	count := 0
+	require.NoError(t, filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			count++
+		}
+		return nil
+	}))
+	require.Equal(t, 1, count, "only one managed final file under configured archive root")
 }
 
 // The mailbox is a deterministic 1..6 test-only feed; it is deliberately NOT a
