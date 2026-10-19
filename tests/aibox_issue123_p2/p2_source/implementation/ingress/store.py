@@ -68,13 +68,17 @@ class IngressStore:
               analysis_profile TEXT NOT NULL DEFAULT '', processor_version TEXT NOT NULL DEFAULT '',
               analysis_status TEXT NOT NULL DEFAULT 'pending',
               analysis_manifest_ref TEXT NOT NULL DEFAULT '', target_policy TEXT NOT NULL DEFAULT '',
-              final_resource_ref TEXT NOT NULL DEFAULT '', handoff_status TEXT NOT NULL DEFAULT 'pending',
+              final_resource_ref TEXT NOT NULL DEFAULT '', commit_mode TEXT NOT NULL DEFAULT '',
+              handoff_status TEXT NOT NULL DEFAULT 'pending',
               state TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '',
               retry_metadata TEXT NOT NULL DEFAULT '{}', updated_at REAL NOT NULL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS ingest_source_identity
               ON ingest_sessions(source_adapter, source_external_id);
             """)
+            columns = {row[1] for row in con.execute("PRAGMA table_info(ingest_sessions)")}
+            if "commit_mode" not in columns:
+                con.execute("ALTER TABLE ingest_sessions ADD COLUMN commit_mode TEXT NOT NULL DEFAULT ''")
 
     def get(self, ingest_id: str) -> dict[str, Any]:
         with self._connect() as con:
@@ -122,45 +126,44 @@ class IngressStore:
         finally:
             os.close(fd)
 
-    def _claim_commit_target(
-        self, ingest_id: str, final_uri: str, preservation_bypass: bool,
-    ) -> None:
-        """Atomically reserve one final target for this ingest session."""
+    def _fsync_archive_ancestors(self, directory: Path) -> None:
+        root = self.final_root.resolve()
+        current = directory
+        while True:
+            resolved = current.resolve()
+            if not resolved.is_relative_to(root):
+                raise IngressError("archive directory escapes final root")
+            self._fsync_directory(current)
+            if resolved == root:
+                break
+            current = current.parent
+    def _claim_commit_target(self, ingest_id: str, final_uri: str, preservation_bypass: bool) -> bool:
+        """Atomically reserve one final target and one commit mode."""
         with self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            row = con.execute(
-                "SELECT state, final_resource_ref, analysis_status FROM ingest_sessions WHERE ingest_id=?",
-                (ingest_id,),
-            ).fetchone()
+            row = con.execute("SELECT state, final_resource_ref, analysis_status, commit_mode FROM ingest_sessions WHERE ingest_id=?", (ingest_id,)).fetchone()
             if not row:
                 raise IngressError(f"unknown ingest_id: {ingest_id}")
-            state = row["state"]
-            recorded = row["final_resource_ref"]
+            state, recorded = row["state"], row["final_resource_ref"]
+            requested = "preservation_bypass" if preservation_bypass else "analyzed"
             if state == "committing":
-                if not recorded:
-                    raise IngressError("committing session has no recorded archive target")
                 if recorded != final_uri:
                     raise IngressError("commit retry must use the originally selected archive target")
-                if row["analysis_status"] != "complete" and not preservation_bypass:
-                    raise IngressError("resuming a preservation-bypass commit requires explicit bypass")
-                return
+                mode = row["commit_mode"] or ("analyzed" if row["analysis_status"] == "complete" else "preservation_bypass")
+                if mode != requested:
+                    raise IngressError("commit retry must preserve the originally selected commit mode")
+                return mode == "preservation_bypass"
             if state == "analyzed":
-                if recorded and recorded != final_uri:
-                    raise IngressError("commit target conflicts with the previously recorded archive target")
-            elif preservation_bypass and state in {"staged", "analyzing"}:
-                if recorded and recorded != final_uri:
-                    raise IngressError("commit target conflicts with the previously recorded archive target")
-            else:
+                if preservation_bypass or row["analysis_status"] != "complete":
+                    raise IngressError("analyzed session requires completed analysis and normal commit mode")
+            elif not (preservation_bypass and state in {"staged", "analyzing"}):
                 raise IngressError(f"commit cannot claim target from state {state}")
-            cursor = con.execute(
-                """UPDATE ingest_sessions
-                   SET state='committing', final_resource_ref=?, updated_at=?
-                   WHERE ingest_id=? AND state=? AND final_resource_ref=?""",
-                (final_uri, time.time(), ingest_id, state, recorded),
-            )
-            if cursor.rowcount != 1:
+            if recorded and recorded != final_uri:
+                raise IngressError("commit target conflicts with the previously recorded archive target")
+            cur = con.execute("UPDATE ingest_sessions SET state='committing', final_resource_ref=?, commit_mode=?, updated_at=? WHERE ingest_id=? AND state=? AND final_resource_ref=?", (final_uri, requested, time.time(), ingest_id, state, recorded))
+            if cur.rowcount != 1:
                 raise IngressError("commit target claim lost a concurrent state change")
-
+            return preservation_bypass
     def stage_bytes(self, ingest_id: str, payload: bytes) -> dict[str, Any]:
         session = self.get(ingest_id)
         if session["state"] == "discovered":
@@ -177,46 +180,72 @@ class IngressStore:
                          content_hash=digest, size=len(payload), last_error="")
         return self.get(ingest_id)
 
-    def stage_file(self, ingest_id: str, source: str | Path,
-                   chunk_size: int = 1024 * 1024) -> dict[str, Any]:
-        """Stage a source file with bounded memory; never mutate the source.
-
-        This is the file-backed Transit path; stage_bytes is for small fixtures.
-        The .part remains the only durable staging copy until verified commit.
-        """
+    def stage_file(self, ingest_id: str, source: str | Path, chunk_size: int = 1024 * 1024) -> dict[str, Any]:
+        """Stream into one durable .part under a serialized SQLite write lock."""
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
         source = Path(source)
         if not source.is_file():
             raise IngressError("source file is unavailable")
         session = self.get(ingest_id)
-        if session["state"] == "discovered":
-            self._transition(ingest_id, "acquiring")
-        elif session["state"] != "acquiring":
-            raise IngressError("stage_file requires acquiring state")
+        if session["state"] not in {"discovered", "acquiring"}:
+            raise IngressError("stage_file requires discovered or acquiring state")
         staging = self.staging_root / f"{ingest_id}.part"
         if staging.exists() and os.path.samefile(source, staging):
             raise IngressError("source file aliases its staging target")
         fd, tmp_name = tempfile.mkstemp(prefix=f".{ingest_id}.stage-", dir=self.staging_root)
         tmp = Path(tmp_name)
-        digest = hashlib.sha256()
-        size = 0
         try:
-            with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
-                while chunk := src.read(chunk_size):
-                    dst.write(chunk)
-                    digest.update(chunk)
-                    size += len(chunk)
-                dst.flush()
-                os.fsync(dst.fileno())
-            os.replace(tmp, staging)
-            self._fsync_directory(self.staging_root)
+            with self._connect() as con:
+                con.execute("BEGIN IMMEDIATE")
+                row = con.execute("SELECT state FROM ingest_sessions WHERE ingest_id=?", (ingest_id,)).fetchone()
+                if not row or row["state"] not in {"discovered", "acquiring"}:
+                    raise IngressError("stage_file requires an unclaimed acquiring session")
+                if row["state"] == "discovered":
+                    con.execute("UPDATE ingest_sessions SET state='acquiring', updated_at=? WHERE ingest_id=? AND state='discovered'", (time.time(), ingest_id))
+                digest, size = hashlib.sha256(), 0
+                with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
+                    fd = -1
+                    while chunk := src.read(chunk_size):
+                        dst.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                os.replace(tmp, staging)
+                self._fsync_directory(self.staging_root)
+                cur = con.execute("UPDATE ingest_sessions SET state='staged', staging_ref=?, content_hash=?, size=?, last_error='', updated_at=? WHERE ingest_id=? AND state IN ('discovered','acquiring')", (str(staging), digest.hexdigest(), size, time.time(), ingest_id))
+                if cur.rowcount != 1:
+                    raise IngressError("staging acknowledgement lost a concurrent state change")
         finally:
+            if fd >= 0:
+                os.close(fd)
             tmp.unlink(missing_ok=True)
-        self._transition(ingest_id, "staged", staging_ref=str(staging),
-                         content_hash=digest.hexdigest(), size=size, last_error="")
         return self.get(ingest_id)
 
+    def recover_staged(self, ingest_id: str) -> dict[str, Any]:
+        """Verify and adopt an atomically installed part after a pre-ack crash."""
+        staging = self.staging_root / f"{ingest_id}.part"
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT state FROM ingest_sessions WHERE ingest_id=?", (ingest_id,)).fetchone()
+            if not row:
+                raise IngressError(f"unknown ingest_id: {ingest_id}")
+            if row["state"] == "staged":
+                return self.get(ingest_id)
+            if row["state"] not in {"discovered", "acquiring"} or not staging.is_file():
+                raise IngressError("no recoverable durable staging object")
+            digest, size = hashlib.sha256(), 0
+            with staging.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+                os.fsync(stream.fileno())
+            self._fsync_directory(self.staging_root)
+            cur = con.execute("UPDATE ingest_sessions SET state='staged', staging_ref=?, content_hash=?, size=?, last_error='', updated_at=? WHERE ingest_id=? AND state IN ('discovered','acquiring')", (str(staging), digest.hexdigest(), size, time.time(), ingest_id))
+            if cur.rowcount != 1:
+                raise IngressError("staging recovery lost a concurrent state change")
+        return self.get(ingest_id)
     def begin_analysis(self, ingest_id: str) -> None:
         self._transition(ingest_id, "analyzing", analysis_status="running")
 
@@ -259,8 +288,9 @@ class IngressStore:
         final_uri = final.as_uri()
         # The write lock and conditional update make the target choice atomic
         # across concurrent workers that observed the same analyzed snapshot.
-        self._claim_commit_target(ingest_id, final_uri, preservation_bypass)
+        commit_bypass = self._claim_commit_target(ingest_id, final_uri, preservation_bypass)
         final.parent.mkdir(parents=True, exist_ok=True)
+        self._fsync_archive_ancestors(final.parent)
         if final.exists():
             if not self._verify(final, session["content_hash"], session["size"]):
                 raise IngressError("existing final object does not match staged source")
@@ -273,11 +303,11 @@ class IngressStore:
                 if not self._verify(tmp, session["content_hash"], session["size"]):
                     raise IngressError("final object failed size/hash verification")
                 os.replace(tmp, final)
-                self._fsync_directory(final.parent)
+                self._fsync_archive_ancestors(final.parent)
             finally:
                 tmp.unlink(missing_ok=True)
-        state = "committed_analysis_pending" if preservation_bypass else "committed"
-        status = "pending" if preservation_bypass else session["analysis_status"]
+        state = "committed_analysis_pending" if commit_bypass else "committed"
+        status = "pending" if commit_bypass else session["analysis_status"]
         self._transition(ingest_id, state, final_resource_ref=final_uri,
                          analysis_status=status, last_error="")
         return self.get(ingest_id)
