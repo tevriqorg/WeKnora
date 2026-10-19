@@ -148,15 +148,23 @@ class IngressStore:
         elif session["state"] != "acquiring":
             raise IngressError("stage_file requires acquiring state")
         staging = self.staging_root / f"{ingest_id}.part"
+        if staging.exists() and os.path.samefile(source, staging):
+            raise IngressError("source file aliases its staging target")
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{ingest_id}.stage-", dir=self.staging_root)
+        tmp = Path(tmp_name)
         digest = hashlib.sha256()
         size = 0
-        with open(source, "rb") as src, open(staging, "wb") as dst:
-            while chunk := src.read(chunk_size):
-                dst.write(chunk)
-                digest.update(chunk)
-                size += len(chunk)
-            dst.flush()
-            os.fsync(dst.fileno())
+        try:
+            with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
+                while chunk := src.read(chunk_size):
+                    dst.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+            os.replace(tmp, staging)
+        finally:
+            tmp.unlink(missing_ok=True)
         self._transition(ingest_id, "staged", staging_ref=str(staging),
                          content_hash=digest.hexdigest(), size=size, last_error="")
         return self.get(ingest_id)
@@ -201,7 +209,17 @@ class IngressStore:
         if not final.resolve().is_relative_to(self.final_root.resolve()):
             raise IngressError("final target escapes archive root")
         final.parent.mkdir(parents=True, exist_ok=True)
-        self._transition(ingest_id, "committing")
+        final_uri = final.as_uri()
+        if session["state"] == "committing":
+            if not session["final_resource_ref"]:
+                raise IngressError("committing session has no recorded archive target")
+            if session["final_resource_ref"] != final_uri:
+                raise IngressError("commit retry must use the originally selected archive target")
+        else:
+            # Persist the archive choice before installing the final object. A
+            # crash in the committing state must not allow a retry to create a
+            # second authoritative Raw at a different name.
+            self._transition(ingest_id, "committing", final_resource_ref=final_uri)
         if final.exists():
             if not self._verify(final, session["content_hash"], session["size"]):
                 raise IngressError("existing final object does not match staged source")
@@ -218,7 +236,7 @@ class IngressStore:
                 tmp.unlink(missing_ok=True)
         state = "committed_analysis_pending" if preservation_bypass else "committed"
         status = "pending" if preservation_bypass else session["analysis_status"]
-        self._transition(ingest_id, state, final_resource_ref=final.as_uri(),
+        self._transition(ingest_id, state, final_resource_ref=final_uri,
                          analysis_status=status, last_error="")
         return self.get(ingest_id)
 

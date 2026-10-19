@@ -6,7 +6,8 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "p2_source"))
+P2_SOURCE_ROOT = Path(__file__).resolve().parent / "p2_source"
+sys.path.insert(0, str(P2_SOURCE_ROOT))
 
 from implementation.ingress.store import IngressStore
 
@@ -18,7 +19,6 @@ def finalize(root: Path) -> None:
         raise RuntimeError("missing receipt from successful actual WeKnora integration test")
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     rows = receipt.get("transit", [])
-    expected = manifest.get("transit", [])
     verified = {
         item.get("source_key"): item
         for item in rows
@@ -26,23 +26,36 @@ def finalize(root: Path) -> None:
         and item.get("knowledge_id")
         and item.get("resource_ref")
     }
+    expected = manifest.get("transit", [])
     if len(rows) != len(expected) or len(verified) != len(expected):
         raise RuntimeError("WeKnora handoff receipt is incomplete or contains duplicate source keys")
+    refs = [proof.get("resource_ref") for proof in verified.values()]
+    if len(set(refs)) != len(expected):
+        raise RuntimeError("WeKnora handoff receipt reuses a Resource reference")
     for item in expected:
         proof = verified.get(item["source_key"])
-        if not proof or proof.get("source_revision_id") != item["source_revision_id"]:
+        if (
+            not proof
+            or proof.get("source_revision_id") != item["source_revision_id"]
+            or proof.get("ingest_id") != item["ingest_id"]
+            or proof.get("resource_path") != item["resource_path"]
+        ):
             raise RuntimeError(f"no matching actual WeKnora handoff receipt: {item['source_key']}")
 
     store = IngressStore(root / "7" / "transit")
     for item in expected:
-        session = store.get(item["ingest_id"])
-        if session["state"] != "handoff_pending":
+        ingest_id = item["ingest_id"]
+        session = store.get(ingest_id)
+        if session["state"] not in {"handoff_pending", "complete"}:
             raise RuntimeError(f"unexpected pre-handoff state: {session['state']}")
-        if not store.can_cleanup_staging(item["ingest_id"]):
-            raise RuntimeError(f"final resource is not verified: {item['ingest_id']}")
-        store.complete_handoff(item["ingest_id"])
-        store.cleanup_staging(item["ingest_id"])
-        completed = store.get(item["ingest_id"])
+        if not store.can_cleanup_staging(ingest_id):
+            raise RuntimeError(f"final resource is not verified: {ingest_id}")
+        if session["state"] == "handoff_pending":
+            store.complete_handoff(ingest_id)
+        # "complete" can be durable before staging cleanup. Accept it on replay
+        # and let cleanup_staging finish the interrupted finalization.
+        store.cleanup_staging(ingest_id)
+        completed = store.get(ingest_id)
         if completed["state"] != "complete" or completed["staging_ref"]:
             raise RuntimeError(f"handoff recovery did not clean staging: {item['ingest_id']}")
         if Path(item["staging_path"]).exists():

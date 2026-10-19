@@ -28,6 +28,30 @@ jobs:
         run: |
           set -euo pipefail
           python3 tests/aibox_issue123_p2/prepare_fixtures.py --root "$RUNNER_TEMP/aibox-issue123"
+      - name: Run P2 ingress bounded-stream and recovery regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tests/aibox_issue123_p2/p2_source/tests/g1:$PWD/tests/aibox_issue123_p2/p2_source"
+          python3 - <<'PY'
+          import sys
+          import unittest
+          sys.path.insert(0, "tests/aibox_issue123_p2/p2_source/tests/g1")
+          import test_ingress
+          names = [
+              "test_file_streaming_rejects_unbounded_and_oversized_reads",
+              "test_stage_file_rejects_hardlink_alias_without_destroying_source",
+              "test_archive_target_rejects_escape_and_does_not_write_outside",
+              "test_durable_staging_survives_restart",
+              "test_commit_ack_uncertainty_recognizes_matching_final",
+              "test_wrong_existing_final_fails_closed",
+              "test_storage_commit_rejects_corrupt_staging",
+              "test_recover_commit_after_conflicting_final_is_cleared_without_fake_handoff",
+          ]
+          suite = unittest.TestSuite(test_ingress.IngressContractTest(name) for name in names)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          sys.exit(not result.wasSuccessful())
+          PY
       - name: Run exact P2-to-WeKnora and virtual mailbox acceptance tests
         shell: bash
         run: |
@@ -38,8 +62,26 @@ jobs:
           AIBOX_ISSUE123_FIXTURE_ROOT="$RUNNER_TEMP/aibox-issue123" \
             go test -count=1 -v ./internal/application/service \
             -run '^TestIssue123P2(AtRestAndTransitFilesHandOffToWeKnora|VirtualMailboxConnectorFetchesByCursor)$'
-      - name: Finalize only from verified WeKnora handoff receipt
+      - name: Verify mismatched resource receipt fails closed, then finalize real handoff
         shell: bash
         run: |
           set -euo pipefail
+          receipt="$RUNNER_TEMP/aibox-issue123/handoff-receipt.json"
+          backup="$RUNNER_TEMP/handoff-receipt.valid.json"
+          cp "$receipt" "$backup"
+          python3 - "$receipt" <<'PY'
+          import json, sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          receipt = json.loads(path.read_text(encoding="utf-8"))
+          receipt["transit"][0]["resource_path"] = "local://7/unrelated/not-the-transit-raw"
+          path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+          PY
+          if python3 tests/aibox_issue123_p2/finalize_fixtures.py --root "$RUNNER_TEMP/aibox-issue123"; then
+            echo "mismatched WeKnora resource path was incorrectly accepted" >&2
+            exit 1
+          fi
+          mv "$backup" "$receipt"
+          python3 tests/aibox_issue123_p2/finalize_fixtures.py --root "$RUNNER_TEMP/aibox-issue123"
+          # Replaying after a completed handoff must be safe and leave no staging.
           python3 tests/aibox_issue123_p2/finalize_fixtures.py --root "$RUNNER_TEMP/aibox-issue123"

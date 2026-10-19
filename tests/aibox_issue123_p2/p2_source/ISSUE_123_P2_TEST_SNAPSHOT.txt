@@ -1,0 +1,4 @@
+P2-AIBOX feature/issue-123-raw-once current tested source commits:
+- latest P2 branch source/test head: e77beba3035ca11922ca2db9b9aa74ecd82482e6
+- includes alias-safe bounded staging, archive-target pinning, receipt binding, resumable finalization, self-contained virtual mailbox doubles, and cursor connector coverage.
+By ChatGPT
