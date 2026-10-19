@@ -218,6 +218,39 @@ class IngressContractTest(unittest.TestCase):
         self.assertEqual(b"durable-original", source.read_bytes())
         self.assertEqual(b"durable-original", staging.read_bytes())
 
+    def test_concurrent_commit_workers_claim_only_one_archive_target(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        session = self.analyzed()
+        barrier = threading.Barrier(2)
+        original_claim = self.store._claim_commit_target
+
+        def synchronized_claim(*args, **kwargs):
+            barrier.wait()
+            return original_claim(*args, **kwargs)
+
+        self.store._claim_commit_target = synchronized_claim
+
+        def attempt(name):
+            try:
+                result = self.store.commit(session["ingest_id"], name)
+                return ("committed", result)
+            except IngressError as exc:
+                return ("rejected", str(exc))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(attempt, ("camera/a.mp4", "camera/b.mp4")))
+
+        self.assertEqual(1, sum(status == "committed" for status, _ in results))
+        self.assertEqual(1, sum(status == "rejected" for status, _ in results))
+        finals = [path for path in self.store.final_root.rglob("*") if path.is_file()]
+        self.assertEqual(1, len(finals), "one ingest session must never create two authoritative finals")
+        stored = self.store.get(session["ingest_id"])
+        self.assertEqual("committed", stored["state"])
+        self.assertEqual(finals[0].as_uri(), stored["final_resource_ref"])
+        self.store._claim_commit_target = original_claim
+
     def test_recover_commit_after_conflicting_final_is_cleared_without_fake_handoff(self):
         session = self.analyzed()
         final = self.store.final_root / "camera" / "clip.mp4"
@@ -238,6 +271,226 @@ class IngressContractTest(unittest.TestCase):
         self.assertEqual("committed", committed["state"])
         self.assertEqual(b"raw-payload", final.read_bytes())
         self.assertTrue(Path(committed["staging_ref"]).is_file())
+ 
+    def test_stage_stream_does_not_hold_database_writer_lock(self):
+        import builtins
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
+        from unittest.mock import patch
+
+        source = self.root / "slow-source.mp4"
+        source.write_bytes(b"slow-but-finite")
+        session = self.new_session()
+        entered, release = threading.Event(), threading.Event()
+        original_open = builtins.open
+
+        class BlockingReader:
+            def __init__(self, stream):
+                self.stream = stream
+            def read(self, size=-1):
+                entered.set()
+                if not release.wait(4):
+                    raise TimeoutError("test source read was not released")
+                return self.stream.read(size)
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+        def guarded_open(path, mode="r", *args, **kwargs):
+            stream = original_open(path, mode, *args, **kwargs)
+            if Path(path) == source and mode == "rb":
+                return BlockingReader(stream)
+            return stream
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            with patch("builtins.open", side_effect=guarded_open):
+                stage = pool.submit(self.store.stage_file, session["ingest_id"], source)
+                self.assertTrue(entered.wait(2), "stage worker did not reach source read")
+                unrelated = pool.submit(self.store.create, "fixture", "unrelated", "fixture://unrelated")
+                try:
+                    self.assertEqual("discovered", unrelated.result(timeout=1)["state"])
+                finally:
+                    release.set()
+                self.assertEqual("staged", stage.result(timeout=3)["state"])
+
+    def test_final_file_is_fsynced_before_atomic_rename(self):
+        import os
+        from unittest.mock import patch
+
+        session = self.analyzed()
+        fsynced_inodes = set()
+        original_fsync, original_replace = os.fsync, os.replace
+
+        def tracked_fsync(fd):
+            fsynced_inodes.add(os.fstat(fd).st_ino)
+            return original_fsync(fd)
+
+        def checked_replace(source, target):
+            source_path = Path(source)
+            if source_path.name.startswith(".commit-"):
+                self.assertIn(source_path.stat().st_ino, fsynced_inodes)
+            return original_replace(source, target)
+
+        with patch("implementation.ingress.store.os.fsync", side_effect=tracked_fsync), patch("implementation.ingress.store.os.replace", side_effect=checked_replace):
+            committed = self.store.commit(session["ingest_id"], "deep/raw.mp4")
+        self.assertEqual("committed", committed["state"])
+        self.assertEqual(b"raw-payload", self.store.final_path(session["ingest_id"]).read_bytes())
+    def test_abandoned_claim_without_part_is_released_for_retry(self):
+        source = self.root / "abandoned-source.mp4"
+        source.write_bytes(b"retry-after-crash")
+        session = self.new_session()
+        with self.store._connect() as con:
+            con.execute("UPDATE ingest_sessions SET state='staging', staging_token='dead-worker' WHERE ingest_id=?", (session["ingest_id"],))
+        released = self.store.recover_staged(session["ingest_id"])
+        self.assertEqual("acquiring", released["state"])
+        retried = self.store.stage_file(session["ingest_id"], source)
+        self.assertEqual("staged", retried["state"])
+        self.assertEqual(b"retry-after-crash", Path(retried["staging_ref"]).read_bytes())
+    def test_failed_temp_creation_releases_staging_claim_for_retry(self):
+        from unittest.mock import patch
+
+        source = self.root / "retry-source.mp4"
+        source.write_bytes(b"retry-after-temp-error")
+        session = self.new_session()
+        with patch("implementation.ingress.store.tempfile.mkstemp", side_effect=OSError("simulated temp failure")):
+            with self.assertRaisesRegex(OSError, "temp failure"):
+                self.store.stage_file(session["ingest_id"], source)
+        self.assertEqual("acquiring", self.store.get(session["ingest_id"])["state"])
+        recovered = self.store.stage_file(session["ingest_id"], source)
+        self.assertEqual("staged", recovered["state"])
+        self.assertEqual(b"retry-after-temp-error", Path(recovered["staging_ref"]).read_bytes())
+
+    def test_recovery_hash_does_not_hold_database_writer_lock(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
+        from unittest.mock import patch
+
+        session = self.staged(b"recoverable-payload")
+        with self.store._connect() as con:
+            con.execute("UPDATE ingest_sessions SET state='staging', staging_token='abandoned' WHERE ingest_id=?", (session["ingest_id"],))
+        staging = Path(session["staging_ref"])
+        entered, release = threading.Event(), threading.Event()
+        original_open = Path.open
+
+        class BlockingReader:
+            def __init__(self, stream):
+                self.stream = stream
+            def read(self, size=-1):
+                entered.set()
+                if not release.wait(4):
+                    raise TimeoutError("test recovery read was not released")
+                return self.stream.read(size)
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+        def guarded_open(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            return BlockingReader(stream) if Path(path) == staging else stream
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            with patch.object(Path, "open", guarded_open):
+                recover = pool.submit(self.store.recover_staged, session["ingest_id"])
+                self.assertTrue(entered.wait(2), "recovery did not reach part hash")
+                unrelated = pool.submit(self.store.create, "fixture", "unrelated", "fixture://unrelated")
+                try:
+                    self.assertEqual("discovered", unrelated.result(timeout=1)["state"])
+                finally:
+                    release.set()
+                self.assertEqual("staged", recover.result(timeout=3)["state"])
+    def test_recover_durable_part_after_pre_ack_crash(self):
+        source = self.root / "only-copy.mp4"
+        source.write_bytes(b"non-retrievable")
+        session = self.new_session()
+        original_fsync = self.store._fsync_directory
+
+        def simulated_crash(path):
+            if path == self.store.staging_root:
+                raise OSError("crash before DB acknowledgement")
+            original_fsync(path)
+
+        self.store._fsync_directory = simulated_crash
+        with self.assertRaisesRegex(OSError, "before DB acknowledgement"):
+            self.store.stage_file(session["ingest_id"], source)
+        self.assertEqual("staging", self.store.get(session["ingest_id"])["state"])
+        self.assertTrue((self.store.staging_root / f'{session["ingest_id"]}.part').exists())
+        self.store._fsync_directory = original_fsync
+        recovered = self.store.recover_staged(session["ingest_id"])
+        self.assertEqual("staged", recovered["state"])
+        self.assertEqual(b"non-retrievable", Path(recovered["staging_ref"]).read_bytes())
+        self.assertEqual(__import__("hashlib").sha256(b"non-retrievable").hexdigest(), recovered["content_hash"])
+
+    def test_concurrent_stage_workers_serialize_shared_part(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import patch
+
+        first, second = self.root / "first.mp4", self.root / "second.mp4"
+        first.write_bytes(b"first snapshot")
+        second.write_bytes(b"second snapshot")
+        session = self.new_session()
+        barrier = threading.Barrier(2)
+        original_uuid4 = __import__("uuid").uuid4
+
+        def synchronized_uuid4():
+            barrier.wait()
+            return original_uuid4()
+
+        def stage(path):
+            try:
+                return ("staged", self.store.stage_file(session["ingest_id"], path))
+            except IngressError as exc:
+                return ("rejected", str(exc))
+
+        with patch("implementation.ingress.store.uuid.uuid4", side_effect=synchronized_uuid4):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(stage, (first, second)))
+        self.assertEqual(1, sum(status == "staged" for status, _ in results))
+        self.assertEqual(1, sum(status == "rejected" for status, _ in results))
+        row = self.store.get(session["ingest_id"])
+        part = Path(row["staging_ref"])
+        self.assertEqual(row["content_hash"], __import__("hashlib").sha256(part.read_bytes()).hexdigest())
+        self.assertIn(part.read_bytes(), (first.read_bytes(), second.read_bytes()))
+    def test_commit_retry_cannot_change_claimed_mode(self):
+        session = self.analyzed()
+        original_fsync = self.store._fsync_archive_ancestors
+
+        def simulated_crash(path):
+            raise OSError("simulated post-claim crash")
+
+        self.store._fsync_archive_ancestors = simulated_crash
+        with self.assertRaisesRegex(OSError, "post-claim"):
+            self.store.commit(session["ingest_id"], "deep/nested/a.mp4")
+        claimed = self.store.get(session["ingest_id"])
+        self.assertEqual("committing", claimed["state"])
+        self.assertEqual("analyzed", claimed["commit_mode"])
+        self.store._fsync_archive_ancestors = original_fsync
+        with self.assertRaisesRegex(IngressError, "commit mode"):
+            self.store.commit(session["ingest_id"], "deep/nested/a.mp4", preservation_bypass=True)
+        committed = self.store.commit(session["ingest_id"], "deep/nested/a.mp4")
+        self.assertEqual("committed", committed["state"])
+        self.assertTrue(self.store.final_path(session["ingest_id"]).is_file())
+
+    def test_nested_archive_directory_ancestors_are_fsynced(self):
+        session = self.analyzed()
+        seen = []
+        original_fsync = self.store._fsync_directory
+
+        def record(path):
+            seen.append(Path(path))
+            original_fsync(Path(path))
+
+        self.store._fsync_directory = record
+        self.store.commit(session["ingest_id"], "deep/nested/a.mp4")
+        self.assertIn(self.store.final_root, seen)
+        self.assertIn(self.store.final_root / "deep", seen)
+        self.assertIn(self.store.final_root / "deep" / "nested", seen)
 
 if __name__ == "__main__":
     unittest.main()
