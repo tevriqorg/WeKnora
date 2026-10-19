@@ -337,6 +337,17 @@ class IngressContractTest(unittest.TestCase):
             committed = self.store.commit(session["ingest_id"], "deep/raw.mp4")
         self.assertEqual("committed", committed["state"])
         self.assertEqual(b"raw-payload", self.store.final_path(session["ingest_id"]).read_bytes())
+    def test_abandoned_claim_without_part_is_released_for_retry(self):
+        source = self.root / "abandoned-source.mp4"
+        source.write_bytes(b"retry-after-crash")
+        session = self.new_session()
+        with self.store._connect() as con:
+            con.execute("UPDATE ingest_sessions SET state='staging', staging_token='dead-worker' WHERE ingest_id=?", (session["ingest_id"],))
+        released = self.store.recover_staged(session["ingest_id"])
+        self.assertEqual("acquiring", released["state"])
+        retried = self.store.stage_file(session["ingest_id"], source)
+        self.assertEqual("staged", retried["state"])
+        self.assertEqual(b"retry-after-crash", Path(retried["staging_ref"]).read_bytes())
     def test_failed_temp_creation_releases_staging_claim_for_retry(self):
         from unittest.mock import patch
 
