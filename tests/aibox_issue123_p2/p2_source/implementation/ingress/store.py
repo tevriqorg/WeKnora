@@ -19,13 +19,14 @@ class IngressError(RuntimeError):
 STATES = {
     "discovered", "acquiring", "staged", "analyzing", "analyzed",
     "committing", "committed", "handoff_pending", "complete",
-    "committed_analysis_pending", "staging",
+    "committed_analysis_pending", "staging", "recovering",
 }
 
 TRANSITIONS = {
     "discovered": {"acquiring"},
     "acquiring": {"staged", "staging"},
-    "staging": {"staged"},
+    "staging": {"staged", "recovering", "acquiring"},
+    "recovering": {"staged", "acquiring"},
     "staged": {"analyzing", "committing"},
     "analyzing": {"analyzed", "committing"},
     "analyzed": {"committing"},
@@ -202,13 +203,15 @@ class IngressStore:
                 raise IngressError(f"unknown ingest_id: {ingest_id}")
             if row["state"] not in {"discovered", "acquiring"}:
                 raise IngressError("stage_file requires an unclaimed discovered/acquiring session")
+            if staging.exists():
+                raise IngressError("durable staging object exists; recover it before restaging")
             cur = con.execute("UPDATE ingest_sessions SET state='staging', staging_token=?, updated_at=? WHERE ingest_id=? AND state=?", (token, time.time(), ingest_id, row["state"]))
             if cur.rowcount != 1:
                 raise IngressError("staging claim lost a concurrent state change")
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{ingest_id}.stage-", dir=self.staging_root)
-        tmp = Path(tmp_name)
-        installed = False
+        fd, tmp, installed = -1, None, False
         try:
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{ingest_id}.stage-", dir=self.staging_root)
+            tmp = Path(tmp_name)
             digest, size = hashlib.sha256(), 0
             with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
                 fd = -1
@@ -233,12 +236,18 @@ class IngressStore:
         finally:
             if fd >= 0:
                 os.close(fd)
-            tmp.unlink(missing_ok=True)
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
         return self.get(ingest_id)
 
     def recover_staged(self, ingest_id: str) -> dict[str, Any]:
-        """Verify and adopt an atomically installed part after a pre-ack crash."""
+        """Startup recovery: release abandoned claims or adopt a durable .part.
+
+        Run before scheduling acquisition workers. File hashing is deliberately
+        outside SQLite's global write transaction.
+        """
         staging = self.staging_root / f"{ingest_id}.part"
+        token = uuid.uuid4().hex
         with self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT state FROM ingest_sessions WHERE ingest_id=?", (ingest_id,)).fetchone()
@@ -246,18 +255,27 @@ class IngressStore:
                 raise IngressError(f"unknown ingest_id: {ingest_id}")
             if row["state"] == "staged":
                 return self.get(ingest_id)
-            if row["state"] not in {"discovered", "acquiring", "staging"} or not staging.is_file():
+            if not staging.is_file():
+                if row["state"] in {"staging", "recovering"}:
+                    con.execute("UPDATE ingest_sessions SET state='acquiring', staging_token='', updated_at=? WHERE ingest_id=? AND state=?", (time.time(), ingest_id, row["state"]))
+                    return self.get(ingest_id)
                 raise IngressError("no recoverable durable staging object")
-            digest, size = hashlib.sha256(), 0
-            with staging.open("rb") as stream:
-                while chunk := stream.read(1024 * 1024):
-                    digest.update(chunk)
-                    size += len(chunk)
-                os.fsync(stream.fileno())
-            self._fsync_directory(self.staging_root)
-            cur = con.execute("UPDATE ingest_sessions SET state='staged', staging_token='', staging_ref=?, content_hash=?, size=?, last_error='', updated_at=? WHERE ingest_id=? AND state IN ('discovered','acquiring','staging')", (str(staging), digest.hexdigest(), size, time.time(), ingest_id))
+            if row["state"] not in {"discovered", "acquiring", "staging", "recovering"}:
+                raise IngressError("no recoverable durable staging object")
+            cur = con.execute("UPDATE ingest_sessions SET state='recovering', staging_token=?, updated_at=? WHERE ingest_id=? AND state=?", (token, time.time(), ingest_id, row["state"]))
             if cur.rowcount != 1:
-                raise IngressError("staging recovery lost a concurrent state change")
+                raise IngressError("staging recovery claim lost a concurrent state change")
+        digest, size = hashlib.sha256(), 0
+        with staging.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+            os.fsync(stream.fileno())
+        self._fsync_directory(self.staging_root)
+        with self._connect() as con:
+            cur = con.execute("UPDATE ingest_sessions SET state='staged', staging_token='', staging_ref=?, content_hash=?, size=?, last_error='', updated_at=? WHERE ingest_id=? AND state='recovering' AND staging_token=?", (str(staging), digest.hexdigest(), size, time.time(), ingest_id, token))
+            if cur.rowcount != 1:
+                raise IngressError("staging recovery lost its ownership token")
         return self.get(ingest_id)
     def begin_analysis(self, ingest_id: str) -> None:
         self._transition(ingest_id, "analyzing", analysis_status="running")

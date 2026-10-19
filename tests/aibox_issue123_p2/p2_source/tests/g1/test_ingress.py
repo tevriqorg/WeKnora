@@ -337,6 +337,62 @@ class IngressContractTest(unittest.TestCase):
             committed = self.store.commit(session["ingest_id"], "deep/raw.mp4")
         self.assertEqual("committed", committed["state"])
         self.assertEqual(b"raw-payload", self.store.final_path(session["ingest_id"]).read_bytes())
+    def test_failed_temp_creation_releases_staging_claim_for_retry(self):
+        from unittest.mock import patch
+
+        source = self.root / "retry-source.mp4"
+        source.write_bytes(b"retry-after-temp-error")
+        session = self.new_session()
+        with patch("implementation.ingress.store.tempfile.mkstemp", side_effect=OSError("simulated temp failure")):
+            with self.assertRaisesRegex(OSError, "temp failure"):
+                self.store.stage_file(session["ingest_id"], source)
+        self.assertEqual("acquiring", self.store.get(session["ingest_id"])["state"])
+        recovered = self.store.stage_file(session["ingest_id"], source)
+        self.assertEqual("staged", recovered["state"])
+        self.assertEqual(b"retry-after-temp-error", Path(recovered["staging_ref"]).read_bytes())
+
+    def test_recovery_hash_does_not_hold_database_writer_lock(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
+        from unittest.mock import patch
+
+        session = self.staged(b"recoverable-payload")
+        with self.store._connect() as con:
+            con.execute("UPDATE ingest_sessions SET state='staging', staging_token='abandoned' WHERE ingest_id=?", (session["ingest_id"],))
+        staging = Path(session["staging_ref"])
+        entered, release = threading.Event(), threading.Event()
+        original_open = Path.open
+
+        class BlockingReader:
+            def __init__(self, stream):
+                self.stream = stream
+            def read(self, size=-1):
+                entered.set()
+                if not release.wait(4):
+                    raise TimeoutError("test recovery read was not released")
+                return self.stream.read(size)
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+        def guarded_open(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            return BlockingReader(stream) if Path(path) == staging else stream
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            with patch.object(Path, "open", guarded_open):
+                recover = pool.submit(self.store.recover_staged, session["ingest_id"])
+                self.assertTrue(entered.wait(2), "recovery did not reach part hash")
+                unrelated = pool.submit(self.store.create, "fixture", "unrelated", "fixture://unrelated")
+                try:
+                    self.assertEqual("discovered", unrelated.result(timeout=1)["state"])
+                finally:
+                    release.set()
+                self.assertEqual("staged", recover.result(timeout=3)["state"])
     def test_recover_durable_part_after_pre_ack_crash(self):
         source = self.root / "only-copy.mp4"
         source.write_bytes(b"non-retrievable")

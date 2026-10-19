@@ -54,6 +54,8 @@ jobs:
               "test_nested_archive_directory_ancestors_are_fsynced",
               "test_stage_stream_does_not_hold_database_writer_lock",
               "test_final_file_is_fsynced_before_atomic_rename",
+              "test_failed_temp_creation_releases_staging_claim_for_retry",
+              "test_recovery_hash_does_not_hold_database_writer_lock",
           ]
           suite = unittest.TestSuite(test_ingress.IngressContractTest(name) for name in names)
           result = unittest.TextTestRunner(verbosity=2).run(suite)
