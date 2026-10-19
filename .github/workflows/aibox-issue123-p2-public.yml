@@ -1,0 +1,45 @@
+name: AIBOX Issue 123 P2 code acceptance
+
+on:
+  pull_request:
+    branches: [aibox-0.8-uat-20261017]
+  push:
+    branches: [feature/issue-123-p2-public-action]
+
+permissions:
+  contents: read
+
+jobs:
+  p2-raw-once-to-weknora:
+    name: P2 source fixtures → actual WeKnora handoff (isolated)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: false
+      - name: Prepare simulated At-rest and Transit files using copied P2 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/aibox_issue123_p2/prepare_fixtures.py --root "$RUNNER_TEMP/aibox-issue123"
+      - name: Run exact P2-to-WeKnora and virtual mailbox acceptance tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp tests/aibox_issue123_p2/p2_raw_once_integration_test.go.in \
+            internal/application/service/p2_raw_once_integration_test.go
+          gofmt -w internal/application/service/p2_raw_once_integration_test.go
+          AIBOX_ISSUE123_FIXTURE_ROOT="$RUNNER_TEMP/aibox-issue123" \
+            go test -count=1 -v ./internal/application/service \
+            -run '^TestIssue123P2(AtRestAndTransitFilesHandOffToWeKnora|VirtualMailboxConnectorFetchesByCursor)$'
+      - name: Finalize only from verified WeKnora handoff receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/aibox_issue123_p2/finalize_fixtures.py --root "$RUNNER_TEMP/aibox-issue123"
