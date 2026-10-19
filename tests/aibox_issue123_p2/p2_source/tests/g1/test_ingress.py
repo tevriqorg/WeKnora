@@ -218,6 +218,32 @@ class IngressContractTest(unittest.TestCase):
         self.assertEqual(b"durable-original", source.read_bytes())
         self.assertEqual(b"durable-original", staging.read_bytes())
 
+    def test_concurrent_commit_workers_claim_only_one_archive_target(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        session = self.analyzed()
+        barrier = threading.Barrier(2)
+
+        def attempt(name):
+            barrier.wait()
+            try:
+                result = self.store.commit(session["ingest_id"], name)
+                return ("committed", result)
+            except IngressError as exc:
+                return ("rejected", str(exc))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(attempt, ("camera/a.mp4", "camera/b.mp4")))
+
+        self.assertEqual(1, sum(status == "committed" for status, _ in results))
+        self.assertEqual(1, sum(status == "rejected" for status, _ in results))
+        finals = [path for path in self.store.final_root.rglob("*") if path.is_file()]
+        self.assertEqual(1, len(finals), "one ingest session must never create two authoritative finals")
+        stored = self.store.get(session["ingest_id"])
+        self.assertEqual("committed", stored["state"])
+        self.assertEqual(finals[0].as_uri(), stored["final_resource_ref"])
+
     def test_recover_commit_after_conflicting_final_is_cleared_without_fake_handoff(self):
         session = self.analyzed()
         final = self.store.final_root / "camera" / "clip.mp4"

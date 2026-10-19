@@ -114,6 +114,53 @@ class IngressStore:
         with self._connect() as con:
             con.execute(f"UPDATE ingest_sessions SET {assignments} WHERE ingest_id=?", (*values.values(), ingest_id))
 
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _claim_commit_target(
+        self, ingest_id: str, final_uri: str, preservation_bypass: bool,
+    ) -> None:
+        """Atomically reserve one final target for this ingest session."""
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT state, final_resource_ref, analysis_status FROM ingest_sessions WHERE ingest_id=?",
+                (ingest_id,),
+            ).fetchone()
+            if not row:
+                raise IngressError(f"unknown ingest_id: {ingest_id}")
+            state = row["state"]
+            recorded = row["final_resource_ref"]
+            if state == "committing":
+                if not recorded:
+                    raise IngressError("committing session has no recorded archive target")
+                if recorded != final_uri:
+                    raise IngressError("commit retry must use the originally selected archive target")
+                if row["analysis_status"] != "complete" and not preservation_bypass:
+                    raise IngressError("resuming a preservation-bypass commit requires explicit bypass")
+                return
+            if state == "analyzed":
+                if recorded and recorded != final_uri:
+                    raise IngressError("commit target conflicts with the previously recorded archive target")
+            elif preservation_bypass and state in {"staged", "analyzing"}:
+                if recorded and recorded != final_uri:
+                    raise IngressError("commit target conflicts with the previously recorded archive target")
+            else:
+                raise IngressError(f"commit cannot claim target from state {state}")
+            cursor = con.execute(
+                """UPDATE ingest_sessions
+                   SET state='committing', final_resource_ref=?, updated_at=?
+                   WHERE ingest_id=? AND state=? AND final_resource_ref=?""",
+                (final_uri, time.time(), ingest_id, state, recorded),
+            )
+            if cursor.rowcount != 1:
+                raise IngressError("commit target claim lost a concurrent state change")
+
     def stage_bytes(self, ingest_id: str, payload: bytes) -> dict[str, Any]:
         session = self.get(ingest_id)
         if session["state"] == "discovered":
@@ -163,6 +210,7 @@ class IngressStore:
                 dst.flush()
                 os.fsync(dst.fileno())
             os.replace(tmp, staging)
+            self._fsync_directory(self.staging_root)
         finally:
             tmp.unlink(missing_ok=True)
         self._transition(ingest_id, "staged", staging_ref=str(staging),
@@ -208,18 +256,11 @@ class IngressStore:
         final = self.final_root / candidate
         if not final.resolve().is_relative_to(self.final_root.resolve()):
             raise IngressError("final target escapes archive root")
-        final.parent.mkdir(parents=True, exist_ok=True)
         final_uri = final.as_uri()
-        if session["state"] == "committing":
-            if not session["final_resource_ref"]:
-                raise IngressError("committing session has no recorded archive target")
-            if session["final_resource_ref"] != final_uri:
-                raise IngressError("commit retry must use the originally selected archive target")
-        else:
-            # Persist the archive choice before installing the final object. A
-            # crash in the committing state must not allow a retry to create a
-            # second authoritative Raw at a different name.
-            self._transition(ingest_id, "committing", final_resource_ref=final_uri)
+        # The write lock and conditional update make the target choice atomic
+        # across concurrent workers that observed the same analyzed snapshot.
+        self._claim_commit_target(ingest_id, final_uri, preservation_bypass)
+        final.parent.mkdir(parents=True, exist_ok=True)
         if final.exists():
             if not self._verify(final, session["content_hash"], session["size"]):
                 raise IngressError("existing final object does not match staged source")
@@ -232,6 +273,7 @@ class IngressStore:
                 if not self._verify(tmp, session["content_hash"], session["size"]):
                     raise IngressError("final object failed size/hash verification")
                 os.replace(tmp, final)
+                self._fsync_directory(final.parent)
             finally:
                 tmp.unlink(missing_ok=True)
         state = "committed_analysis_pending" if preservation_bypass else "committed"
