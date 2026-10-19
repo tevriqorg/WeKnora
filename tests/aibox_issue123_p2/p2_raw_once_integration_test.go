@@ -1,0 +1,412 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	apprepo "github.com/Tencent/WeKnora/internal/application/repository"
+	appfile "github.com/Tencent/WeKnora/internal/application/service/file"
+	"github.com/Tencent/WeKnora/internal/datasource"
+	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/hibiken/asynq"
+	"github.com/stretchr/testify/require"
+)
+
+type issue123P2Fixture struct {
+	AtRest  []issue123P2File `json:"at_rest"`
+	Transit []issue123P2File `json:"transit"`
+}
+
+type issue123P2HandoffReceipt struct {
+	SourceKey         string `json:"source_key"`
+	SourceRevisionID  string `json:"source_revision_id"`
+	KnowledgeID       string `json:"knowledge_id"`
+	ResourceRef       string `json:"resource_ref"`
+	VerifiedByWeKnora bool   `json:"verified_by_weknora"`
+}
+
+type issue123P2File struct {
+	SourceKey       string `json:"source_key"`
+	SourceRevision  string `json:"source_revision_id"`
+	ResourcePath    string `json:"resource_path"`
+	RelativePath    string `json:"relative_path"`
+	OriginalName    string `json:"original_name"`
+	Size            int64  `json:"size"`
+	IngestID        string `json:"ingest_id,omitempty"`
+	StagingPath     string `json:"staging_path,omitempty"`
+}
+
+func issue123ReadRaw(t *testing.T, root string, item issue123P2File) ([]byte, string) {
+	t.Helper()
+	relative := filepath.Clean(filepath.FromSlash(item.RelativePath))
+	if filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		t.Fatalf("invalid fixture relative path: %q", item.RelativePath)
+	}
+	path := filepath.Join(root, relative)
+	rootAbs, err := filepath.Abs(root)
+	require.NoError(t, err)
+	pathAbs, err := filepath.Abs(path)
+	require.NoError(t, err)
+	if !strings.HasPrefix(pathAbs, rootAbs+string(filepath.Separator)) {
+		t.Fatalf("fixture path escapes root: %q", item.RelativePath)
+	}
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, item.Size, int64(len(raw)))
+	sum := sha256.Sum256(raw)
+	require.Equal(t, fmt.Sprintf("sha256:%x", sum), item.SourceRevision)
+	return raw, path
+}
+
+type issue123FailOnceRevisionStore struct {
+	inner  derivedSourceRevisionStore
+	failed bool
+}
+
+func (s *issue123FailOnceRevisionStore) UpsertSourceRevision(
+	ctx context.Context, revision *types.SourceRevision,
+) (*types.SourceRevision, bool, error) {
+	if !s.failed {
+		s.failed = true
+		return nil, false, errors.New("synthetic crash before source revision acknowledgement")
+	}
+	return s.inner.UpsertSourceRevision(ctx, revision)
+}
+
+func TestIssue123P2AtRestAndTransitFilesHandOffToWeKnora(t *testing.T) {
+	root := os.Getenv("AIBOX_ISSUE123_FIXTURE_ROOT")
+	require.NotEmpty(t, root, "CI must supply P2-generated isolated fixtures")
+	rawManifest, err := os.ReadFile(filepath.Join(root, "fixture.json"))
+	require.NoError(t, err)
+	var manifest issue123P2Fixture
+	require.NoError(t, json.Unmarshal(rawManifest, &manifest))
+	require.Len(t, manifest.AtRest, 3)
+	require.Len(t, manifest.Transit, 4)
+
+	mini := miniredis.RunT(t)
+	client := asynq.NewClient(asynq.RedisClientOpt{Addr: mini.Addr()})
+	defer func() { require.NoError(t, client.Close()) }()
+
+	fixture := newDocumentWriteFixture(t)
+	fixture.svc.kbService = &g2OrdinaryDocKBService{kb: fixture.kbs.values["kb"]}
+	fixture.svc.task = client
+	require.NoError(t, fixture.db.AutoMigrate(
+		&types.SourceRevision{}, &types.StoredResource{}, &types.ResourceBinding{}, &types.ResourceAccessGrant{},
+	))
+	catalog := NewResourceCatalog(apprepo.NewResourceRepository(fixture.db))
+	fileService := appfile.NewResourceCatalogFileService(appfile.NewLocalFileService(root, ""), catalog)
+	revisionStore, ok := any(apprepo.NewKnowledgeRepository(fixture.db)).(derivedSourceRevisionStore)
+	require.True(t, ok)
+	derived := newDerivedKnowledgeEnvelopeService(fixture.svc, revisionStore)
+
+	handoff := func(item issue123P2File, failOnce bool) (*types.Knowledge, string) {
+		raw, _ := issue123ReadRaw(t, root, item)
+		ref, err := catalog.Register(fixture.ctx, 7, item.ResourcePath, interfaces.ResourceRegistration{
+			Kind: "file", Ownership: types.ResourceOwnershipExternal, OriginalName: item.OriginalName, Size: item.Size,
+		})
+		require.NoError(t, err)
+		same, err := catalog.Register(fixture.ctx, 7, item.ResourcePath, interfaces.ResourceRegistration{
+			Kind: "file", Ownership: types.ResourceOwnershipExternal,
+		})
+		require.NoError(t, err)
+		require.Equal(t, ref, same, "re-registering the same source must preserve its resource identity")
+
+		reader, err := fileService.GetFile(fixture.ctx, ref)
+		require.NoError(t, err)
+		got, err := io.ReadAll(reader)
+		require.NoError(t, err)
+		require.NoError(t, reader.Close())
+		require.Equal(t, raw, got, "WeKnora must read the exact P2-owned final or external Raw")
+
+		envelope := &types.DerivedKnowledgeEnvelope{
+			SourceKey: item.SourceKey, SourceRevisionID: item.SourceRevision,
+			DerivedObjectID: item.SourceKey, Title: item.OriginalName,
+			Markdown: string(raw), SourceResourceRef: ref,
+			SourceLocators: types.SourceLocators{{Type: types.SourceLocatorText, SourceID: item.SourceKey}},
+			Processor: "issue123-fixture", ProcessorVersion: "1",
+			Capabilities: []string{"metadata"}, AnalysisStatus: "ready", ProducedAt: time.Now().UTC(),
+		}
+
+		if failOnce {
+			retrying := newDerivedKnowledgeEnvelopeService(fixture.svc, &issue123FailOnceRevisionStore{inner: revisionStore})
+			partial, err := retrying.Upsert(fixture.ctx, "kb", envelope)
+			require.Error(t, err, "the injected lost acknowledgement must be observable")
+			require.NotNil(t, partial, "the deterministic draft should remain recoverable")
+		}
+		knowledge, err := derived.Upsert(fixture.ctx, "kb", envelope)
+		require.NoError(t, err, "retry must perform the actual WeKnora handoff")
+		require.NotEmpty(t, knowledge.ID)
+		require.NoError(t, catalog.Bind(fixture.ctx, ref, types.ResourceOwnerKnowledge,
+			knowledge.ID, types.ResourceRelationSourceFile))
+		replay, err := derived.Upsert(fixture.ctx, "kb", envelope)
+		require.NoError(t, err)
+		require.Equal(t, knowledge.ID, replay.ID, "handoff replay must preserve Knowledge identity")
+		stored, err := fixture.repo.GetKnowledgeByID(fixture.ctx, 7, knowledge.ID)
+		require.NoError(t, err)
+		require.Empty(t, stored.FilePath, "derived ingestion must not SaveFile a second Raw")
+		var revision types.SourceRevision
+		require.NoError(t, fixture.db.First(&revision, "knowledge_id = ?", knowledge.ID).Error)
+		require.Equal(t, ref, revision.ResourceRef, "SourceRevision must point to the final/external Resource")
+		return knowledge, ref
+	}
+
+	// At-rest descriptors are produced by P2's read-only helper. Register and
+	// hand off those exact identities/revisions to WeKnora; no source file moves.
+	for _, item := range manifest.AtRest {
+		knowledge, ref := handoff(item, false)
+		remaining, err := catalog.Release(fixture.ctx, ref, types.ResourceOwnerKnowledge, knowledge.ID)
+		require.NoError(t, err)
+		require.Positive(t, remaining, "external Raw must stay protected after its Knowledge binding is released")
+		require.NoError(t, fileService.DeleteFile(fixture.ctx, ref))
+		raw, path := issue123ReadRaw(t, root, item)
+		after, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Equal(t, raw, after, "Knowledge/resource deletion must preserve external Raw")
+	}
+	archiveDir := filepath.Join(root, "7", "qnap", "archive")
+	archiveEntries, err := os.ReadDir(archiveDir)
+	require.NoError(t, err)
+	require.Len(t, archiveEntries, 3, "At-rest handoff must create no Raw copy")
+
+	// Transit files come from P2's bounded-memory IngressStore stage/verify/
+	// commit path. WeKnora receives the final locator and never calls SaveFile.
+	receipt := make([]issue123P2HandoffReceipt, 0, len(manifest.Transit))
+	for i, item := range manifest.Transit {
+		if item.StagingPath != "" {
+			_, err := os.Stat(item.StagingPath)
+			require.NoError(t, err, "staging remains until WeKnora confirms the handoff")
+		}
+		knowledge, ref := handoff(item, i == 0)
+		receipt = append(receipt, issue123P2HandoffReceipt{
+			SourceKey: item.SourceKey, SourceRevisionID: item.SourceRevision,
+			KnowledgeID: knowledge.ID, ResourceRef: ref, VerifiedByWeKnora: true,
+		})
+	}
+	finalDir := filepath.Join(root, "7", "transit", "final")
+	finalEntries, err := os.ReadDir(finalDir)
+	require.NoError(t, err)
+	require.Len(t, finalEntries, 4, "WeKnora handoff must leave one final Raw per Transit source")
+	receiptBytes, err := json.MarshalIndent(struct {
+		Transit []issue123P2HandoffReceipt `json:"transit"`
+	}{Transit: receipt}, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "handoff-receipt.json"), receiptBytes, 0o600),
+		"emit receipt only after every actual WeKnora handoff and DB assertion succeeded")
+}
+
+
+
+var issue123MailDeleteCalls int
+
+func (k *issue123MailKnowledge) DeleteKnowledge(_ context.Context, _ string) error {
+	issue123MailDeleteCalls++
+	return nil
+}
+
+func (r *issue123MailRepository) HardDeleteKnowledge(_ context.Context, _ uint64, id string) error {
+	delete(r.rows, id)
+	return nil
+}
+
+type issue123MailEvent struct {
+	cursor int
+	item   types.FetchedItem
+}
+
+type issue123VirtualMailboxConnector struct {
+	events   []issue123MailEvent
+	delivered [][]string
+}
+
+func (c *issue123VirtualMailboxConnector) Type() string { return "mockmail" }
+func (c *issue123VirtualMailboxConnector) Validate(context.Context, *types.DataSourceConfig) error {
+	return nil
+}
+func (c *issue123VirtualMailboxConnector) ListResources(context.Context, *types.DataSourceConfig, string) ([]types.Resource, error) {
+	return nil, nil
+}
+func (c *issue123VirtualMailboxConnector) ResolveResourceAncestors(context.Context, *types.DataSourceConfig, []string) ([]string, error) {
+	return nil, nil
+}
+func (c *issue123VirtualMailboxConnector) FetchAll(context.Context, *types.DataSourceConfig, []string) ([]types.FetchedItem, error) {
+	return nil, nil
+}
+func (c *issue123VirtualMailboxConnector) FetchIncremental(
+	context.Context, *types.DataSourceConfig, *types.SyncCursor,
+) ([]types.FetchedItem, *types.SyncCursor, error) {
+	return nil, nil, nil
+}
+func (c *issue123VirtualMailboxConnector) FetchStream(
+	ctx context.Context, _ *types.DataSourceConfig, start *types.SyncCursor, handler datasource.StreamHandler,
+) (*types.SyncCursor, error) {
+	last := 0
+	if start != nil {
+		switch value := start.ConnectorCursor["event_cursor"].(type) {
+		case float64:
+			last = int(value)
+		case int:
+			last = value
+		}
+	}
+	delivered := []string{}
+	for _, event := range c.events {
+		if event.cursor <= last {
+			continue
+		}
+		if err := handler.Emit(ctx, event.item); err != nil {
+			return nil, err
+		}
+		delivered = append(delivered, event.item.ExternalID)
+		last = event.cursor
+		cursor := &types.SyncCursor{ConnectorCursor: map[string]interface{}{"event_cursor": float64(last)}}
+		if err := handler.Checkpoint(ctx, cursor); err != nil {
+			return nil, err
+		}
+	}
+	c.delivered = append(c.delivered, delivered)
+	return &types.SyncCursor{ConnectorCursor: map[string]interface{}{"event_cursor": float64(last)}}, nil
+}
+
+var _ datasource.StreamingConnector = (*issue123VirtualMailboxConnector)(nil)
+
+func issue123MailCursor(ds *types.DataSource) int {
+	cursor, err := ds.ParseSyncCursor()
+	if err != nil || cursor == nil {
+		return 0
+	}
+	switch value := cursor.ConnectorCursor["event_cursor"].(type) {
+	case float64:
+		return int(value)
+	case int:
+		return value
+	default:
+		return 0
+	}
+}
+
+func issue123MailItem(id string, cursor int, version string, deleted bool) types.FetchedItem {
+	return types.FetchedItem{
+		ExternalID: id, Title: "Virtual " + id, FileName: id + ".eml",
+		URL: "https://mail.invalid/" + id, IsDeleted: deleted,
+		Metadata: map[string]string{
+			"native_version": version, "event_cursor": fmt.Sprint(cursor),
+		},
+	}
+}
+
+func TestIssue123P2VirtualMailboxConnectorFetchesByCursor(t *testing.T) {
+	issue123MailDeleteCalls = 0
+	repo := &issue123MailRepository{rows: make(map[string]*types.Knowledge)}
+	knowledge := &issue123MailKnowledge{repo: repo}
+	ds := &types.DataSource{
+		ID: "virtual-mail", Type: "mockmail", TenantID: 7, KnowledgeBaseID: "kb-1",
+		SyncDeletions: true,
+	}
+	dsRepo := &recordingDSRepo{}
+	svc := &DataSourceService{
+		knowledgeService: knowledge, dsRepo: dsRepo,
+		syncLogRepo: &processSyncSyncLogRepo{logs: map[string]*types.SyncLog{}},
+	}
+	mailbox := &issue123VirtualMailboxConnector{
+		events: []issue123MailEvent{
+			{1, issue123MailItem("message-1", 1, "v1", false)},
+			{2, issue123MailItem("message-2", 2, "v1", false)},
+			{3, issue123MailItem("message-3", 3, "v1", false)},
+		},
+	}
+	run := func() *types.SyncResult {
+		start, err := streamStartCursor(ds, false, 0)
+		require.NoError(t, err)
+		result := &types.SyncResult{}
+		syncLog := &types.SyncLog{ID: fmt.Sprintf("virtual-mail-%d", len(mailbox.delivered)+1)}
+		syncLogs := &processSyncSyncLogRepo{logs: map[string]*types.SyncLog{syncLog.ID: syncLog}}
+		svc.syncLogRepo = syncLogs
+		handler := &streamSyncHandler{svc: svc, ds: ds, result: result, syncLog: syncLog}
+		next, err := mailbox.FetchStream(context.Background(), &types.DataSourceConfig{}, start, handler)
+		require.NoError(t, err)
+		require.NotNil(t, next)
+		stored, err := ds.ParseSyncCursor()
+		require.NoError(t, err)
+		require.NotNil(t, stored, "the real stream handler must persist connector checkpoints")
+		require.Equal(t, next.ConnectorCursor, stored.ConnectorCursor,
+			"the returned connector cursor must match its persisted checkpoint")
+		require.NotEmpty(t, dsRepo.updated, "DataSourceService checkpoint path must persist sync state")
+		return result
+	}
+
+	first := run()
+	require.Equal(t, []string{"message-1", "message-2", "message-3"}, mailbox.delivered[0])
+	require.Equal(t, 3, first.Created)
+	cursorAfterThree := append(types.JSON(nil), ds.LastSyncCursor...)
+	before := map[string]string{}
+	for id, row := range repo.rows {
+		before[row.GetMetadata()["external_id"]] = id
+	}
+
+	for n := 4; n <= 6; n++ {
+		mailbox.events = append(mailbox.events, issue123MailEvent{
+			n, issue123MailItem(fmt.Sprintf("message-%d", n), n, "v1", false),
+		})
+	}
+	second := run()
+	require.Equal(t, []string{"message-4", "message-5", "message-6"}, mailbox.delivered[1])
+	require.Equal(t, 3, second.Created)
+	require.Len(t, repo.rows, 6)
+
+	// A replay from the checkpoint after message 3 re-fetches only 4–6. The
+	// real DataSourceService.ingestItem path must keep the same six Knowledge IDs.
+	ds.LastSyncCursor = cursorAfterThree
+	replayed := run()
+	require.Equal(t, []string{"message-4", "message-5", "message-6"}, mailbox.delivered[2])
+	require.Equal(t, 0, replayed.Created)
+	require.Len(t, repo.rows, 6)
+	for externalID, originalID := range before {
+		kn, err := repo.FindByDataSourceExternalID(context.Background(), 7, "kb-1", "virtual-mail", externalID)
+		require.NoError(t, err)
+		require.NotNil(t, kn)
+		require.Equal(t, originalID, kn.ID)
+	}
+
+	mailbox.events = append(mailbox.events, issue123MailEvent{
+		7, issue123MailItem("message-2", 7, "v2", false),
+	})
+	updated := run()
+	require.Equal(t, []string{"message-2"}, mailbox.delivered[3])
+	require.Equal(t, 1, updated.Updated)
+	require.Equal(t, 1, knowledge.replaced)
+	kn, err := repo.FindByDataSourceExternalID(context.Background(), 7, "kb-1", "virtual-mail", "message-2")
+	require.NoError(t, err)
+	require.NotNil(t, kn)
+	require.Equal(t, before["message-2"], kn.ID, "revision updates must retain stable Knowledge identity")
+	require.Equal(t, "v2", kn.GetMetadata()["native_version"])
+
+	cursorBeforeWithdraw := append(types.JSON(nil), ds.LastSyncCursor...)
+	mailbox.events = append(mailbox.events, issue123MailEvent{
+		8, issue123MailItem("message-1", 8, "v1", true),
+	})
+	withdrawn := run()
+	require.Equal(t, []string{"message-1"}, mailbox.delivered[4])
+	require.Equal(t, 1, withdrawn.Deleted)
+	require.Equal(t, 1, issue123MailDeleteCalls)
+	gone, err := repo.FindByDataSourceExternalID(context.Background(), 7, "kb-1", "virtual-mail", "message-1")
+	require.NoError(t, err)
+	require.Nil(t, gone)
+
+	ds.LastSyncCursor = cursorBeforeWithdraw
+	withdrawReplay := run()
+	require.Equal(t, []string{"message-1"}, mailbox.delivered[5])
+	require.Equal(t, 0, withdrawReplay.Deleted, "replayed withdrawal is idempotent")
+	require.Equal(t, 1, issue123MailDeleteCalls)
+	require.Len(t, repo.rows, 5)
+}
