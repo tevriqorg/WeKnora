@@ -31,6 +31,8 @@ type issue123P2Fixture struct {
 type issue123P2HandoffReceipt struct {
 	SourceKey         string `json:"source_key"`
 	SourceRevisionID  string `json:"source_revision_id"`
+	IngestID          string `json:"ingest_id"`
+	ResourcePath      string `json:"resource_path"`
 	KnowledgeID       string `json:"knowledge_id"`
 	ResourceRef       string `json:"resource_ref"`
 	VerifiedByWeKnora bool   `json:"verified_by_weknora"`
@@ -116,6 +118,9 @@ func TestIssue123P2AtRestAndTransitFilesHandOffToWeKnora(t *testing.T) {
 			Kind: "file", Ownership: types.ResourceOwnershipExternal, OriginalName: item.OriginalName, Size: item.Size,
 		})
 		require.NoError(t, err)
+		resource, err := catalog.Resolve(fixture.ctx, ref)
+		require.NoError(t, err)
+		require.Equal(t, item.ResourcePath, resource.PhysicalPath, "registered Resource must resolve to this source final/external locator")
 		same, err := catalog.Register(fixture.ctx, 7, item.ResourcePath, interfaces.ResourceRegistration{
 			Kind: "file", Ownership: types.ResourceOwnershipExternal,
 		})
@@ -189,8 +194,8 @@ func TestIssue123P2AtRestAndTransitFilesHandOffToWeKnora(t *testing.T) {
 		}
 		knowledge, ref := handoff(item, i == 0)
 		receipt = append(receipt, issue123P2HandoffReceipt{
-			SourceKey: item.SourceKey, SourceRevisionID: item.SourceRevision,
-			KnowledgeID: knowledge.ID, ResourceRef: ref, VerifiedByWeKnora: true,
+			SourceKey: item.SourceKey, SourceRevisionID: item.SourceRevision, IngestID: item.IngestID,
+			ResourcePath: item.ResourcePath, KnowledgeID: knowledge.ID, ResourceRef: ref, VerifiedByWeKnora: true,
 		})
 	}
 	finalDir := filepath.Join(root, "7", "transit", "final")

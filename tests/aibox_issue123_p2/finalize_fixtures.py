@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "p2_source"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from implementation.ingress.store import IngressStore
 
@@ -18,7 +18,6 @@ def finalize(root: Path) -> None:
         raise RuntimeError("missing receipt from successful actual WeKnora integration test")
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     rows = receipt.get("transit", [])
-    expected = manifest.get("transit", [])
     verified = {
         item.get("source_key"): item
         for item in rows
@@ -26,11 +25,20 @@ def finalize(root: Path) -> None:
         and item.get("knowledge_id")
         and item.get("resource_ref")
     }
+    expected = manifest.get("transit", [])
     if len(rows) != len(expected) or len(verified) != len(expected):
         raise RuntimeError("WeKnora handoff receipt is incomplete or contains duplicate source keys")
+    refs = [proof.get("resource_ref") for proof in verified.values()]
+    if len(set(refs)) != len(expected):
+        raise RuntimeError("WeKnora handoff receipt reuses a Resource reference")
     for item in expected:
         proof = verified.get(item["source_key"])
-        if not proof or proof.get("source_revision_id") != item["source_revision_id"]:
+        if (
+            not proof
+            or proof.get("source_revision_id") != item["source_revision_id"]
+            or proof.get("ingest_id") != item["ingest_id"]
+            or proof.get("resource_path") != item["resource_path"]
+        ):
             raise RuntimeError(f"no matching actual WeKnora handoff receipt: {item['source_key']}")
 
     store = IngressStore(root / "7" / "transit")

@@ -148,15 +148,23 @@ class IngressStore:
         elif session["state"] != "acquiring":
             raise IngressError("stage_file requires acquiring state")
         staging = self.staging_root / f"{ingest_id}.part"
+        if staging.exists() and os.path.samefile(source, staging):
+            raise IngressError("source file aliases its staging target")
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{ingest_id}.stage-", dir=self.staging_root)
+        tmp = Path(tmp_name)
         digest = hashlib.sha256()
         size = 0
-        with open(source, "rb") as src, open(staging, "wb") as dst:
-            while chunk := src.read(chunk_size):
-                dst.write(chunk)
-                digest.update(chunk)
-                size += len(chunk)
-            dst.flush()
-            os.fsync(dst.fileno())
+        try:
+            with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
+                while chunk := src.read(chunk_size):
+                    dst.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+            os.replace(tmp, staging)
+        finally:
+            tmp.unlink(missing_ok=True)
         self._transition(ingest_id, "staged", staging_ref=str(staging),
                          content_hash=digest.hexdigest(), size=size, last_error="")
         return self.get(ingest_id)

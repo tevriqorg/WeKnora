@@ -174,6 +174,18 @@ class IngressContractTest(unittest.TestCase):
         self.assertEqual("complete", recovered.get(session["ingest_id"])["state"])
 
 
+    def test_stage_file_rejects_hardlink_alias_without_destroying_source(self):
+        session = self.new_session()
+        self.store._transition(session["ingest_id"], "acquiring")
+        staging = self.store.staging_root / f'{session["ingest_id"]}.part'
+        staging.write_bytes(b"durable-original")
+        source = self.root / "hardlink.mp4"
+        source.hardlink_to(staging)
+        with self.assertRaisesRegex(IngressError, "aliases its staging target"):
+            self.store.stage_file(session["ingest_id"], source)
+        self.assertEqual(b"durable-original", source.read_bytes())
+        self.assertEqual(b"durable-original", staging.read_bytes())
+
     def test_recover_commit_after_conflicting_final_is_cleared_without_fake_handoff(self):
         session = self.analyzed()
         final = self.store.final_root / "camera" / "clip.mp4"
