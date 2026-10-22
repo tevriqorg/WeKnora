@@ -76,7 +76,8 @@ func safeAIBOXSourceResourcePath(prefix, candidate string) bool {
 		return false
 	}
 	relative := strings.TrimPrefix(candidate, prefix)
-	return relative != "" && !strings.HasPrefix(relative, "/") &&
+	return relative != "" && relative != ".." && !strings.HasPrefix(relative, "../") &&
+		!strings.HasPrefix(relative, "/") &&
 		!strings.Contains(relative, "\\") && !strings.Contains(relative, "%") &&
 		!strings.Contains(relative, "//") && !strings.ContainsRune(relative, '\x00') &&
 		path.Clean(relative) == relative
