@@ -41,14 +41,19 @@ def check(state_dir,now=None):
     return {"result":"PASS","mode":trial["mode"],"reason":"read_only_watchdog_no_gate_promotion"}
 
 
-def notify_issue_once(state_dir,incident_id):
+def notify_issue_once(state_dir,incident_id,*,test_mode=False):
     """Explicitly enabled auth action; if missing/failing report NOT_DELIVERED."""
     already={e["incident_id"] for e in read_events(state_dir/"delivery.jsonl")
              if e.get("status")=="CONFIRMED" and e.get("incident_id")}
     if incident_id in already:
         return "ALREADY_CONFIRMED"
     # Use gh preconfigured auth; do not embed token, server address or raw logs.
-    message=f"P2 #126 watchdog INCIDENT {incident_id}: testing signal missing. See protected Vela evidence. No success verdict; investigate."
+    if test_mode:
+        message=(f"[DRILL — NO REAL INCIDENT] P2 #126 watchdog GitHub notification test: {incident_id}. "
+                 "Do not open a bug or change long-test gate from this delivery test.")
+    else:
+        message=(f"P2 #126 watchdog INCIDENT {incident_id}: testing signal missing. "
+                 "See protected Vela evidence. No success verdict; investigate.")
     run=subprocess.run(["gh","issue","comment","126","-R","tevriqorg/P2-AIBOX",
                         "--body",message],capture_output=True,text=True,timeout=15,check=False)
     if run.returncode != 0:
