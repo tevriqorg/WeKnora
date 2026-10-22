@@ -75,6 +75,7 @@ func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandl
 		kb.POST("/manual", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), handler.CreateManualKnowledge)
 		// P2 0.8: same authenticated, KB-scoped API; no second MCP or task queue.
 		kb.POST("/derived", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), handler.UpsertDerivedKnowledge)
+		kb.POST("/external-resource", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), handler.RegisterAIBOXExternalResource)
 		kbRead.GET("", g.Viewer(), g.KBAccessRead("id"), handler.ListKnowledge)
 		// 原始文件下载沿用单文件下载的 Contributor + Editor 权限边界。
 		kbRead.POST("/batch-download", g.Contributor(), g.KBAccessWrite("id"), handler.BatchDownloadKnowledge)

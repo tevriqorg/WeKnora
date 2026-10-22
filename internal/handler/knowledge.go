@@ -32,6 +32,7 @@ import (
 type KnowledgeHandler struct {
 	cfg               *config.Config
 	kgService         interfaces.KnowledgeService
+	aiboxResources    interfaces.ResourceCatalog
 	kbService         interfaces.KnowledgeBaseService
 	kbShareService    interfaces.KBShareService
 	agentShareService interfaces.AgentShareService
