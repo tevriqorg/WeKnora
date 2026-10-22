@@ -70,6 +70,7 @@
 - **LEARNING_COMMITTED**：将事故分类为 `root_cause_signature`（如 race、wrong locator、idempotency、parser、permissions、temporal、outage）；固定为可版本追踪的 `tests/regressions/INCIDENT-ID`、最小 fixture、expected assertion 与 CI gate；在 #126 报告复现方式、修复 PR、负例、风险领域权重更新。
 - **VERIFIED_CLOSED**：targeted+broader+现场 canary 同时 PASS、review 已批准、关联 issue/checkpoint 完整才允许关闭。即使 Bug 修好，历史失败/重启计时记录不能抹掉。
 - **自主发现新测试**：每晚以当天失败模式、遗漏的 source×lifecycle 组合、边界条件和近期 PR 触及文件，生成候选`case_proposal`；先做去重/风险/隐私/预算评估。**允许自动增加沙箱安全测试和相应 CI**，但不允许未经 review 自动修改锁定 oracle、减少断言、降低阈值、扩大网络访问或执行有破坏性的真实 UAT 故障注入。风险与未覆盖项优先排序，每日记录 `new_cases / promoted_regressions / escaped_bugs / coverage_delta`。
+- **学习调度实现**：控制面 `risk_scheduler.py` 根据实际 Incident 次数、根因匹配与未覆盖必测项动态生成 live 或 clone 各自的候选列表；禁止直接执行、改变冻结矩阵、把 clone-only 用例带到 live。只有存在可持续的执行者且获得授权后，这些候选才能形成真正新的测试，不得把「自动排序」冒充「自动执行或自动修复」。
 - **学习验证**：周期性执行 mutation/negative assertions（故意错误的 SHA、错误的 locator、伪 receipt、跨租户 token、假时间事实）证明测试确实能报红；如果测试失明，即使业务表面 PASS 也判 BLOCKED。反复出现同类 bug，提升该类回归频率，不因测试数量增加而减少独立样本来源多样性。
 - 修复权限说明：已经授权按既有需求修 Bug 与测试，但需要新增生产权限、真实邮箱/家庭资源、扩大公网或高风险操作时停止并取得另行授权；安全边界优先于“自动修到绿”。
 

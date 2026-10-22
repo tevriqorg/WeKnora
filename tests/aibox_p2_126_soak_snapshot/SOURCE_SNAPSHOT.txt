@@ -1,4 +1,4 @@
 source_repo=tevriqorg/P2-AIBOX
 source_pr=127
-source_sha=33ff8a5ce8328df903d2db6a339943d881488b41
+source_sha=77f59c97a08e7cc64de62c7cc96dae79e5018174
 intent=public GitHub-hosted isolated design/runtime harness verification; no credentials or user data

@@ -51,6 +51,7 @@ def main():
     p.add_argument("--state-dir",type=Path,required=True)
     p.add_argument("--corpus-root",type=Path,required=True)
     p.add_argument("--manifest",type=Path,required=True)
+    p.add_argument("--notify",action="store_true",help="On failure use validated GitHub issue alert")
     args=p.parse_args()
     try:
         result=inspect_corpus(args.corpus_root,args.manifest)
@@ -58,7 +59,10 @@ def main():
         result={"result":"PRECHECK_FAIL","case_id":"AR01","mode":"preflight",
                 "timestamp_utc":now_utc(),"error_type":type(e).__name__}
         # Only registered root, not the raw filenames or private bytes, in incident.
-        failing_incident(args.state_dir,case_id="AR01",signature="raw_corruption",source_id="public-corpus")
+        incident=failing_incident(args.state_dir,case_id="AR01",signature="raw_corruption",source_id="public-corpus")
+        if args.notify:
+            from watchdog import notify_issue_once
+            result["notification"]=notify_issue_once(args.state_dir,incident["incident_id"])
     append_event(args.state_dir/"corpus_checks.jsonl",result)
     print(json.dumps(result,sort_keys=True))
     if result["result"]!="PRECHECK_PASS":
