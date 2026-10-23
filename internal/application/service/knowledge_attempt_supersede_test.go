@@ -332,3 +332,46 @@ func TestKnowledgePostProcessRunsCurrentAttempt(t *testing.T) {
 	require.NoError(t, json.Unmarshal(pendingRepo.seededOp.Payload, &op))
 	assert.Equal(t, 1, op.Attempt, "the wiki op records the attempt that owns its slot")
 }
+
+// A queued v1 manual task must not process the stable Knowledge row after a
+// v2 derived envelope has replaced its body and locators. In particular, the
+// old task must not reach KB lookup, mark processing, or clean up v2 chunks.
+func TestProcessManualUpdateSkipsStaleDerivedRevisionBeforeKBAccess(t *testing.T) {
+    current := &types.Knowledge{ID: "k-1", TenantID: 1, KnowledgeBaseID: "kb-1", ParseStatus: types.ParseStatusPending}
+    require.NoError(t, current.SetManualMetadata(types.NewManualKnowledgeMetadata("v2 corrected text", types.ManualKnowledgeStatusPublish, 2)))
+    require.NoError(t, current.SetDerivedMetadata(&types.DerivedKnowledgeMetadata{SnapshotHash: "v2-snapshot", SourceRevisionID: "native-v2"}))
+    repo := &embedFailureKnowledgeRepo{knowledge: current}
+    svc := &knowledgeService{
+        repo: repo,
+        tenantRepo: &summaryRefreshTenantRepo{tenant: &types.Tenant{ID: 1}},
+        kbService: &g2OrdinaryDocKBService{kb: nil}, // any access means the stale task escaped the fence
+    }
+    raw, err := json.Marshal(types.ManualProcessPayload{
+        TenantID: 1, KnowledgeID: "k-1", KnowledgeBaseID: "kb-1", Content: "v1 obsolete text", NeedCleanup: true,
+    })
+    require.NoError(t, err)
+    err = svc.ProcessManualUpdate(context.Background(), asynq.NewTask(types.TypeManualProcess, raw))
+    require.NoError(t, err, "obsolete queued work must be acknowledged without touching v2")
+    require.Empty(t, repo.updates, "obsolete work must not write the current Knowledge")
+    require.Equal(t, types.ParseStatusPending, current.ParseStatus)
+}
+
+// Ordinary legacy manual tasks whose content still matches the persisted row
+// remain eligible for processing; fencing must not drop valid pending work.
+func TestProcessManualUpdateLegacyCurrentContentStillProcesses(t *testing.T) {
+    current := &types.Knowledge{ID: "k-1", TenantID: 1, KnowledgeBaseID: "kb-1", ParseStatus: types.ParseStatusPending}
+    require.NoError(t, current.SetManualMetadata(types.NewManualKnowledgeMetadata("current text", types.ManualKnowledgeStatusPublish, 1)))
+    repo := &embedFailureKnowledgeRepo{knowledge: current}
+    svc := &knowledgeService{
+        repo: repo,
+        tenantRepo: &summaryRefreshTenantRepo{tenant: &types.Tenant{ID: 1}},
+        kbService: &g2OrdinaryDocKBService{kb: nil},
+    }
+    raw, err := json.Marshal(types.ManualProcessPayload{
+        TenantID: 1, KnowledgeID: "k-1", KnowledgeBaseID: "kb-1", Content: "current text",
+    })
+    require.NoError(t, err)
+    err = svc.ProcessManualUpdate(context.Background(), asynq.NewTask(types.TypeManualProcess, raw))
+    require.ErrorContains(t, err, "processing task KB owner changed", "matching current content must pass the revision fence")
+    require.Empty(t, repo.updates)
+}
