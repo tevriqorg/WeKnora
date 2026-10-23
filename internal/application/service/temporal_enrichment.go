@@ -69,6 +69,17 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 		logger.Warnf(ctx, "temporal: no current SourceRevision for knowledge=%s; leaving temporal state degraded", payload.KnowledgeID)
 		return nil
 	}
+	knowledge, err := s.knowledgeRepo.GetKnowledgeByID(ctx, payload.TenantID, payload.KnowledgeID)
+	if err != nil {
+		return fmt.Errorf("get temporal knowledge metadata: %w", err)
+	}
+	derived, err := knowledge.DerivedMetadata()
+	if err != nil {
+		return fmt.Errorf("read temporal derived snapshot: %w", err)
+	}
+	if derived != nil && derived.SnapshotHash == "" {
+		return fmt.Errorf("derived temporal snapshot hash missing")
+	}
 	chunks, err := s.chunkRepo.ListChunksByKnowledgeIDAndTypes(ctx, payload.TenantID, payload.KnowledgeID,
 		[]types.ChunkType{types.ChunkTypeText, types.ChunkTypeImageOCR, types.ChunkTypeImageCaption})
 	if err != nil {
@@ -77,6 +88,26 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 	windows, err := buildTemporalEvidenceWindows(chunks, defaultTemporalWindowChars)
 	if err != nil {
 		return fmt.Errorf("build temporal evidence windows: %w", err)
+	}
+	episodeIDs := make([]string, len(windows))
+	for i, window := range windows {
+		var episodeID string
+		if derived != nil {
+			episodeID, err = deterministicDerivedTemporalEpisodeUUID(payload.KnowledgeID, revision.RevisionID, generation.GenerationID, window.Ordinal, derived.SnapshotHash)
+		} else {
+			episodeID, err = deterministicTemporalEpisodeUUID(payload.KnowledgeID, revision.RevisionID, generation.GenerationID, window.Ordinal)
+		}
+		if err != nil {
+			return err
+		}
+		episodeIDs[i] = episodeID
+	}
+	if derived != nil {
+		// Old facts must not remain current while the replacement is pending.
+		// A new Graphiti UUID forces extraction instead of cached replay.
+		if err := s.temporalRepo.MarkSupersededEpisodeBindings(ctx, generation.GenerationID, payload.KnowledgeID, revision.RevisionID, episodeIDs); err != nil {
+			return fmt.Errorf("invalidate stale derived temporal bindings: %w", err)
+		}
 	}
 	if len(windows) == 0 {
 		logger.Infof(ctx, "temporal: no evidence windows for knowledge=%s", payload.KnowledgeID)
@@ -93,11 +124,8 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 	referenceTime := temporalReferenceTime(revision)
 	authorityKey := "knowledge:" + payload.KnowledgeID
 
-	for _, window := range windows {
-		episodeUUID, err := deterministicTemporalEpisodeUUID(payload.KnowledgeID, revision.RevisionID, generation.GenerationID, window.Ordinal)
-		if err != nil {
-			return err
-		}
+	for i, window := range windows {
+		episodeUUID := episodeIDs[i]
 		existing, err := s.temporalRepo.GetEpisodeBinding(ctx, generation.GenerationID, episodeUUID)
 		if err != nil {
 			return fmt.Errorf("get temporal episode binding: %w", err)

@@ -84,6 +84,26 @@ func (r *TemporalRepository) UpsertEpisodeBinding(ctx context.Context, binding *
 	}).Create(binding).Error
 }
 
+// MarkSupersededEpisodeBindings removes old derived projections from the
+// current evidence view before a corrected snapshot is extracted. The raw
+// SourceRevision stays authoritative and is never rewritten by this method.
+// An adapter failure leaves the new projection degraded, not silently stale.
+func (r *TemporalRepository) MarkSupersededEpisodeBindings(ctx context.Context, generationID, knowledgeID, revisionID string, keepEpisodeUUIDs []string) error {
+	if generationID == "" || knowledgeID == "" || revisionID == "" {
+		return errors.New("temporal projection scope is required")
+	}
+	q := r.db.WithContext(ctx).Model(&types.TemporalEpisodeBinding{}).
+		Where("generation_id = ? AND knowledge_id = ? AND source_revision_id = ?", generationID, knowledgeID, revisionID).
+		Where("temporal_status IN ?", []types.TemporalStatus{
+			types.TemporalStatusPending, types.TemporalStatusRunning,
+			types.TemporalStatusReady, types.TemporalStatusFailed,
+		})
+	if len(keepEpisodeUUIDs) > 0 {
+		q = q.Where("episode_uuid NOT IN ?", keepEpisodeUUIDs)
+	}
+	return q.Update("temporal_status", types.TemporalStatusStale).Error
+}
+
 func (r *TemporalRepository) InsertTransitions(ctx context.Context, transitions []types.TemporalTransitionBinding) error {
 	if len(transitions) == 0 {
 		return nil
