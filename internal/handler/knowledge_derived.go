@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/hex"
 	"net/http"
 	"os"
 	"path"
@@ -76,11 +77,22 @@ func safeAIBOXSourceResourcePath(prefix, candidate string) bool {
 		return false
 	}
 	relative := strings.TrimPrefix(candidate, prefix)
-	return relative != "" && relative != ".." && !strings.HasPrefix(relative, "../") &&
+	return relative != "" && relative != "." && relative != ".." && !strings.HasPrefix(relative, "../") &&
 		!strings.HasPrefix(relative, "/") &&
 		!strings.Contains(relative, "\\") && !strings.Contains(relative, "%") &&
 		!strings.Contains(relative, "//") && !strings.ContainsRune(relative, '\x00') &&
 		path.Clean(relative) == relative
+}
+
+// validAIBOXSourceSHA256 prevents a forged or malformed source fingerprint
+// from being recorded as verified provenance. This validates syntax only:
+// independent corpus verification still has to hash the actual source bytes.
+func validAIBOXSourceSHA256(value string) bool {
+    if len(value) != 64 {
+        return false
+    }
+    _, err := hex.DecodeString(value)
+    return err == nil
 }
 
 // RegisterAIBOXExternalResource records an approved, remotely authoritative
@@ -116,7 +128,7 @@ func (h *KnowledgeHandler) RegisterAIBOXExternalResource(c *gin.Context) {
 		_ = c.Error(errors.NewBadRequestError("Invalid external source descriptor"))
 		return
 	}
-	if !safeAIBOXSourceResourcePath(prefix, req.ResourcePath) || req.Size < 0 {
+	if !safeAIBOXSourceResourcePath(prefix, req.ResourcePath) || req.Size < 0 || !validAIBOXSourceSHA256(req.SHA256) {
 		_ = c.Error(errors.NewBadRequestError("External source is outside approved UAT root"))
 		return
 	}
