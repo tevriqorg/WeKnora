@@ -1149,8 +1149,27 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 	knowledge *types.Knowledge, content string, needCleanup bool, options ...asynq.Option,
 ) (string, error) {
+	manualMeta, err := knowledge.ManualMetadata()
+	if err != nil {
+		return "", fmt.Errorf("read manual metadata before enqueue: %w", err)
+	}
+	if manualMeta == nil || manualMeta.Content != content {
+		return "", fmt.Errorf("manual content changed before enqueue")
+	}
+	derivedMeta, err := knowledge.DerivedMetadata()
+	if err != nil {
+		return "", fmt.Errorf("read derived metadata before enqueue: %w", err)
+	}
+	derivedHash := ""
+	if derivedMeta != nil {
+		if derivedMeta.SnapshotHash == "" {
+			return "", fmt.Errorf("derived snapshot hash missing before enqueue")
+		}
+		derivedHash = derivedMeta.SnapshotHash
+	}
 	requestID, _ := types.RequestIDFromContext(ctx)
 	payload := types.ManualProcessPayload{
+		ManualVersion: manualMeta.Version, DerivedSnapshotHash: derivedHash,
 		RequestId:       requestID,
 		TenantID:        knowledge.TenantID,
 		KnowledgeID:     knowledge.ID,

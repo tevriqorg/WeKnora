@@ -375,3 +375,29 @@ func TestProcessManualUpdateLegacyCurrentContentStillProcesses(t *testing.T) {
     require.ErrorContains(t, err, "processing task KB owner changed", "matching current content must pass the revision fence")
     require.Empty(t, repo.updates)
 }
+
+// A processor may correct locators without changing Markdown. The snapshot
+// identity, not just the text, must fence a queued derived processing task.
+func TestProcessManualUpdateSkipsSameTextOlderDerivedSnapshot(t *testing.T) {
+    current := &types.Knowledge{ID: "k-1", TenantID: 1, KnowledgeBaseID: "kb-1", ParseStatus: types.ParseStatusPending}
+    require.NoError(t, current.SetManualMetadata(types.NewManualKnowledgeMetadata("same markdown", types.ManualKnowledgeStatusPublish, 2)))
+    require.NoError(t, current.SetDerivedMetadata(&types.DerivedKnowledgeMetadata{SnapshotHash: "new-locators", SourceRevisionID: "native-v2"}))
+    repo := &embedFailureKnowledgeRepo{knowledge: current}
+    svc := &knowledgeService{repo: repo, tenantRepo: &summaryRefreshTenantRepo{tenant: &types.Tenant{ID: 1}}, kbService: &g2OrdinaryDocKBService{kb: nil}}
+    for _, old := range []types.ManualProcessPayload{
+        {TenantID: 1, KnowledgeID: "k-1", KnowledgeBaseID: "kb-1", Content: "same markdown", ManualVersion: 1, DerivedSnapshotHash: "old-locators", NeedCleanup: true},
+        {TenantID: 1, KnowledgeID: "k-1", KnowledgeBaseID: "kb-1", Content: "same markdown", ManualVersion: 2, DerivedSnapshotHash: "old-locators", NeedCleanup: true},
+        {TenantID: 1, KnowledgeID: "k-1", KnowledgeBaseID: "kb-1", Content: "same markdown", NeedCleanup: true}, // pre-upgrade legacy derived task
+    } {
+        raw, err := json.Marshal(old)
+        require.NoError(t, err)
+        require.NoError(t, svc.ProcessManualUpdate(context.Background(), asynq.NewTask(types.TypeManualProcess, raw)))
+    }
+    require.Empty(t, repo.updates)
+    require.Equal(t, types.ParseStatusPending, current.ParseStatus)
+
+    latest := types.ManualProcessPayload{TenantID: 1, KnowledgeID: "k-1", KnowledgeBaseID: "kb-1", Content: "same markdown", ManualVersion: 2, DerivedSnapshotHash: "new-locators", NeedCleanup: true}
+    raw, err := json.Marshal(latest)
+    require.NoError(t, err)
+    require.ErrorContains(t, svc.ProcessManualUpdate(context.Background(), asynq.NewTask(types.TypeManualProcess, raw)), "processing task KB owner changed", "latest snapshot must not be silently discarded")
+}

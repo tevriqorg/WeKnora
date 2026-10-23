@@ -512,6 +512,8 @@ type ManualProcessPayload struct {
 	KnowledgeBaseID string `json:"knowledge_base_id"`
 	Content         string `json:"content"`      // cleaned markdown content
 	NeedCleanup     bool   `json:"need_cleanup"` // true for update, false for create
+	ManualVersion   int    `json:"manual_version,omitempty"` // version at enqueue time
+	DerivedSnapshotHash string `json:"derived_snapshot_hash,omitempty"` // exact derived projection at enqueue time
 }
 
 // ImageMultimodalPayload represents the image multimodal processing task payload.
