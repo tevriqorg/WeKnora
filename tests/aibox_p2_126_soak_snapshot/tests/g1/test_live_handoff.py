@@ -25,6 +25,10 @@ class LiveHandoffContract(unittest.TestCase):
             assert '"verified_by_weknora": false' in path.read_text()
         self.assertEqual([x[0] for x in self.calls],['external-resource','derived'])
 
+    def test_rejects_nonhex_source_integrity_claim(self):
+        with self.assertRaises(HandoffError):
+            self.client.register_external(resource_path="local://10000/aibox-uat-soak/raw.md",size=12,sha256="z"*64,filename="raw.md",mime="text/markdown")
+
     def test_rejects_bad_ref_and_receipt(self):
         with self.assertRaises(HandoffError):
             self.client.upsert_derived({'source_key':'a','source_revision_id':'rev','idempotency_key':'key'},resource_ref='local://fake')

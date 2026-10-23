@@ -6,6 +6,7 @@ claim a completed handoff unless both API calls return confirmed identities.
 from __future__ import annotations
 
 import json
+import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -65,7 +66,8 @@ class WeKnoraHandoff:
 
     def register_external(self, *, resource_path: str, size: int, sha256: str,
                           filename: str, mime: str) -> str:
-        if not resource_path.startswith('local://') or size < 0 or len(sha256) != 64:
+        if (not resource_path.startswith('local://') or size < 0 or len(sha256) != 64
+                or any(ch not in string.hexdigits for ch in sha256)):
             raise HandoffError('Invalid stable external source descriptor')
         result = self._transport('external-resource', {
             'resource_path': resource_path, 'size': size, 'sha256': sha256,
