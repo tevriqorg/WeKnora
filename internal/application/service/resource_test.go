@@ -291,3 +291,38 @@ func TestResourceCatalogRejectsOwnershipConflictForSamePhysicalObject(t *testing
 	})
 	require.ErrorContains(t, err, "resource ownership conflict")
 }
+
+// Regression P2 #126: a stable external resource handle cannot silently
+// claim a new raw fingerprint/size when the path has changed in place.
+// A caller must explicitly handle the new raw revision; stale provenance
+// cannot be returned as a successful external registration.
+func TestAIBOXExternalReRegistrationMustNotReuseStaleFingerprint(t *testing.T) {
+    catalog, _ := newResourceCatalogForTest(t)
+    ctx := context.Background()
+    path := "local://7/aibox126/source-v1.pdf"
+    first := interfaces.ResourceRegistration{
+        Ownership: types.ResourceOwnershipExternal,
+        Kind: "source", ContentHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        Size: 101,
+    }
+    ref, err := catalog.Register(ctx, 7, path, first)
+    require.NoError(t, err)
+    same, err := catalog.Register(ctx, 7, path, first)
+    require.NoError(t, err)
+    require.Equal(t, ref, same, "identical replay must remain idempotent")
+
+    changedHash := first
+    changedHash.ContentHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    _, err = catalog.Register(ctx, 7, path, changedHash)
+    require.ErrorContains(t, err, "external resource fingerprint conflict")
+
+    changedSize := first
+    changedSize.Size = 102
+    _, err = catalog.Register(ctx, 7, path, changedSize)
+    require.ErrorContains(t, err, "external resource fingerprint conflict")
+
+    stored, err := catalog.Resolve(ctx, ref)
+    require.NoError(t, err)
+    require.Equal(t, first.ContentHash, stored.ContentHash)
+    require.Equal(t, first.Size, stored.Size)
+}
