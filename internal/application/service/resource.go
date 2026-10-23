@@ -42,6 +42,26 @@ func resourceLocationHash(path string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// validateResourceReplay never returns an old verified external fingerprint
+// for a changed raw object at the same physical path. A new raw revision must
+// be handled explicitly instead of silently claiming a stale Resource hash.
+func validateResourceReplay(
+    existing *types.StoredResource, desiredOwnership string, meta interfaces.ResourceRegistration,
+) error {
+    existingOwnership := existing.Ownership
+    if existingOwnership == "" {
+        existingOwnership = types.ResourceOwnershipManaged
+    }
+    if desiredOwnership != "" && existingOwnership != desiredOwnership {
+        return fmt.Errorf("resource ownership conflict: existing=%s requested=%s", existingOwnership, desiredOwnership)
+    }
+    if desiredOwnership == types.ResourceOwnershipExternal && meta.ContentHash != "" &&
+        (existing.ContentHash != meta.ContentHash || existing.Size != meta.Size) {
+        return fmt.Errorf("external resource fingerprint conflict: raw revision must be explicitly handled")
+    }
+    return nil
+}
+
 func (s *resourceCatalog) Register(
 	ctx context.Context,
 	tenantID uint64,
@@ -65,12 +85,8 @@ func (s *resourceCatalog) Register(
 		return "", err
 	}
 	if existing != nil {
-		existingOwnership := existing.Ownership
-		if existingOwnership == "" {
-			existingOwnership = types.ResourceOwnershipManaged
-		}
-		if desiredOwnership != "" && existingOwnership != desiredOwnership {
-			return "", fmt.Errorf("resource ownership conflict: existing=%s requested=%s", existingOwnership, desiredOwnership)
+		if err := validateResourceReplay(existing, desiredOwnership, meta); err != nil {
+			return "", err
 		}
 		return types.BuildResourcePath(existing.Handle), nil
 	}
@@ -119,12 +135,8 @@ func (s *resourceCatalog) Register(
 		}
 		existing, lookupErr := s.repo.GetByTenantLocation(ctx, tenantID, locationHash)
 		if lookupErr == nil && existing != nil {
-			existingOwnership := existing.Ownership
-			if existingOwnership == "" {
-				existingOwnership = types.ResourceOwnershipManaged
-			}
-			if desiredOwnership != "" && existingOwnership != desiredOwnership {
-				return "", fmt.Errorf("resource ownership conflict: existing=%s requested=%s", existingOwnership, desiredOwnership)
+			if err := validateResourceReplay(existing, desiredOwnership, meta); err != nil {
+				return "", err
 			}
 			return types.BuildResourcePath(existing.Handle), nil
 		}
