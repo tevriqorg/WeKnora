@@ -165,8 +165,62 @@ def _is_sha256(value):
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
-def _valid_case_evidence(entry, case, gate, start, now):
-    """Every mandatory matrix evidence field must be present and gate-pinned."""
+def _verified_oracle_sources(state_dir, gate):
+    """Only a frozen, hash-pinned manifest can establish a source fingerprint."""
+    path = state_dir / "frozen-oracle.json"
+    if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+        return {}
+    raw = path.read_bytes()
+    if len(raw) > 2_000_000 or hashlib.sha256(raw).hexdigest() != gate["oracle_sha256"]:
+        return {}
+    try:
+        manifest = json.loads(raw)
+        if manifest.get("schema") != "p2-126-frozen-oracle-v1":
+            return {}
+        items = manifest["sources"]
+        if not isinstance(items, list) or not items:
+            return {}
+        mapping = {}
+        for item in items:
+            source_id = sanitized_label(item["source_id"])
+            digest = item["sha256"]
+            if source_id in mapping or not _is_sha256(digest):
+                return {}
+            mapping[source_id] = digest
+        return mapping
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return {}
+
+
+def _verified_case_artifact(state_dir, entry):
+    """Re-hash a private immutable evidence JSON, not merely a claimed digest."""
+    digest = entry["evidence_sha256"]
+    directory = state_dir / "case-evidence"
+    path = directory / (digest + ".json")
+    if (directory.is_symlink() or not directory.is_dir() or directory.stat().st_mode & 0o077
+            or path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077):
+        return False
+    raw = path.read_bytes()
+    if len(raw) > 2_000_000 or hashlib.sha256(raw).hexdigest() != digest:
+        return False
+    try:
+        proof = json.loads(raw)
+        if not isinstance(proof, dict):
+            return False
+        for key in ("trial_id","case_id","result","layer","source_id","source_sha256",
+                    "p2_sha","weknora_sha","runtime_digest","oracle_hash","oracle_sha256","timestamp_utc"):
+            if proof.get(key) != entry.get(key):
+                return False
+        assertions = proof.get("assertions")
+        return (isinstance(assertions, list) and bool(assertions)
+                and all(isinstance(x, dict) and x.get("passed") is True
+                        and isinstance(x.get("name"), str) and x["name"] for x in assertions))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _valid_case_evidence(entry, case, gate, start, now, state_dir, sources):
+    """Every mandatory matrix field must bind to signed versions and real bytes."""
     if not isinstance(entry, dict) or any(not entry.get(k) for k in case["evidence_required"]):
         return False
     if (entry.get("trial_id") != gate["trial_id"] or entry.get("result") != "PASS"
@@ -177,29 +231,38 @@ def _valid_case_evidence(entry, case, gate, start, now):
             or entry.get("oracle_hash") != gate["oracle_sha256"]
             or entry.get("oracle_sha256") != gate["oracle_sha256"]
             or not _is_sha256(entry.get("source_sha256"))
-            or not _is_sha256(entry.get("evidence_sha256"))):
+            or not _is_sha256(entry.get("evidence_sha256"))
+            or sources.get(entry.get("source_id")) != entry.get("source_sha256")):
         return False
     try:
         stamped = parse_time(entry["timestamp_utc"])
-        return start <= stamped <= now
+        return start <= stamped <= now and _verified_case_artifact(state_dir, entry)
     except (TypeError, ValueError, AttributeError):
         return False
 
 
 def _critical_trial_incidents(events, start, now):
-    """A repaired P0/P1 invalidates the old trial, including after closure."""
-    invalid = set()
+    """Reject both new critical incidents and open critical incidents at Gate t0."""
+    grouped = {}
     for entry in events:
-        if (entry.get("state") not in ("DETECTED", "REOPENED")
-                or entry.get("severity") not in ("P0", "P1")
+        if (entry.get("severity") not in ("P0", "P1")
                 or not entry.get("incident_id")):
             continue
         try:
             stamp = parse_time(entry.get("detected_utc") or entry.get("timestamp_utc"))
         except (TypeError, ValueError, AttributeError):
             continue
-        if start <= stamp <= now:
-            invalid.add(entry["incident_id"])
+        if stamp <= now:
+            grouped.setdefault(entry["incident_id"], []).append((stamp, entry.get("state")))
+    invalid = []
+    for ident, history in grouped.items():
+        history.sort(key=lambda x:x[0])
+        before = [state for when,state in history if when <= start]
+        open_at_start = bool(before and before[-1] != "VERIFIED_CLOSED")
+        new_fault = any(start <= when <= now and state in ("DETECTED","REOPENED")
+                        for when,state in history)
+        if open_at_start or new_fault:
+            invalid.append(ident)
     return sorted(invalid)
 
 
@@ -244,9 +307,10 @@ def evaluate(state_dir: Path, *, now=None, gate_key=None, base=HERE):
         except (KeyError, ValueError, TypeError):
             continue
     passed = set()
+    oracle_sources = _verified_oracle_sources(state_dir, gate)
     for e in read_events(state_dir / "case_results.jsonl"):
         case = cases.get(e.get("case_id"))
-        if case and _valid_case_evidence(e, case, gate, start, now):
+        if case and _valid_case_evidence(e, case, gate, start, now, state_dir, oracle_sources):
             passed.add(e["case_id"])
     missing_cases = sorted(set(cases) - passed)
     missing_l0 = sorted(set(range(completed_slots)) - l0_by_slot)
