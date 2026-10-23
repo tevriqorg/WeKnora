@@ -160,6 +160,8 @@ func TestDerivedRevisionUpdatePersistsHistoryOnStableKnowledge(t *testing.T) {
 	require.False(t, history[0].IsCurrent)
 	require.True(t, history[1].IsCurrent)
 	require.Equal(t, "rev-2", history[1].NativeVersion)
+	require.Equal(t, next.SourceResourceRef, history[1].ResourceRef)
+	require.Equal(t, next.SourceKey, history[1].Locator)
 	upgrade := *next
 	upgrade.IdempotencyKey = ""
 	upgrade.ProcessorVersion = "consumer-api-v3"
