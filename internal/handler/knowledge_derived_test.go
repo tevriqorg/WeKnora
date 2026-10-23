@@ -11,6 +11,7 @@ func TestAIBOXExternalResourcePathIsConfined(t *testing.T) {
 		{"local://7/aibox-uat-soak/reports/1.pdf", true},
 		{"local://7/aibox-uat-soak/reports/1.mp4", true},
 		{"local://7/aibox-uat-soak/", false},
+		{"local://7/aibox-uat-soak/.", false}, // root disguised as a relative file
 		{"local://7/aibox-uat-soak/../other", false},
 		{"local://7/aibox-uat-soak/reports//1.pdf", false},
 		{"local://7/aibox-uat-soak/%2e%2e/x", false},
