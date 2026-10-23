@@ -35,7 +35,7 @@ def api_get(resource: str, token: str, transport=None):
     url = API_URL + resource
     if transport:
         return transport(url, token)
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token,
+    req = urllib.request.Request(url, headers={"X-API-Key": token,
                                                 "User-Agent": "aibox-p2-readonly-soak-v1"})
     with urllib.request.urlopen(req, timeout=12) as response:
         if response.status != 200:
