@@ -56,7 +56,7 @@ func (s *DerivedKnowledgeEnvelopeService) Upsert(ctx context.Context, kbID strin
 	if !ok {
 		return nil, errors.New("workspace ID not found in context")
 	}
-	knowledgeID := types.DerivedKnowledgeID(tenantID, kbID, meta.IdempotencyKey)
+	knowledgeID := types.DerivedSourceKnowledgeID(tenantID, kbID, meta.SourceKey, meta.DerivedObjectID)
 	payload := &types.ManualKnowledgePayload{
 		Title: envelope.Title, Content: envelope.Content(), Status: types.ManualKnowledgeStatusDraft,
 		Channel: derivedKnowledgeChannel, RequestedKnowledgeID: knowledgeID, DerivedMetadata: meta,
@@ -80,7 +80,8 @@ func (s *DerivedKnowledgeEnvelopeService) Upsert(ctx context.Context, kbID strin
 		if err != nil {
 			return nil, err
 		}
-		if stored == nil || stored.IdempotencyKey != meta.IdempotencyKey || existing.KnowledgeBaseID != kbID {
+		if stored == nil || stored.SourceKey != meta.SourceKey ||
+			stored.DerivedObjectID != meta.DerivedObjectID || existing.KnowledgeBaseID != kbID {
 			return nil, errors.New("deterministic derived knowledge id is already bound to different provenance")
 		}
 	}
