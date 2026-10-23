@@ -161,6 +161,48 @@ def parse_time(v):
     return x.astimezone(UTC)
 
 
+def _is_sha256(value):
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def _valid_case_evidence(entry, case, gate, start, now):
+    """Every mandatory matrix evidence field must be present and gate-pinned."""
+    if not isinstance(entry, dict) or any(not entry.get(k) for k in case["evidence_required"]):
+        return False
+    if (entry.get("trial_id") != gate["trial_id"] or entry.get("result") != "PASS"
+            or entry.get("case_id") != case["id"] or entry.get("layer") != case["layer"]
+            or entry.get("p2_sha") != gate["p2_sha"]
+            or entry.get("weknora_sha") != gate["weknora_sha"]
+            or entry.get("runtime_digest") != gate["runtime_digest"]
+            or entry.get("oracle_hash") != gate["oracle_sha256"]
+            or entry.get("oracle_sha256") != gate["oracle_sha256"]
+            or not _is_sha256(entry.get("source_sha256"))
+            or not _is_sha256(entry.get("evidence_sha256"))):
+        return False
+    try:
+        stamped = parse_time(entry["timestamp_utc"])
+        return start <= stamped <= now
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _critical_trial_incidents(events, start, now):
+    """A repaired P0/P1 invalidates the old trial, including after closure."""
+    invalid = set()
+    for entry in events:
+        if (entry.get("state") not in ("DETECTED", "REOPENED")
+                or entry.get("severity") not in ("P0", "P1")
+                or not entry.get("incident_id")):
+            continue
+        try:
+            stamp = parse_time(entry.get("detected_utc") or entry.get("timestamp_utc"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if start <= stamp <= now:
+            invalid.add(entry["incident_id"])
+    return sorted(invalid)
+
+
 def evaluate(state_dir: Path, *, now=None, gate_key=None, base=HERE):
     """Truthful status; 360 hours alone is never a PASS."""
     now = now or dt.datetime.now(UTC)
@@ -203,20 +245,22 @@ def evaluate(state_dir: Path, *, now=None, gate_key=None, base=HERE):
             continue
     passed = set()
     for e in read_events(state_dir / "case_results.jsonl"):
-        if (e.get("trial_id")==gate["trial_id"] and e.get("result")=="PASS"
-            and e.get("oracle_sha256")==gate["oracle_sha256"] and e.get("evidence_sha256")):
-            passed.add(e.get("case_id"))
+        case = cases.get(e.get("case_id"))
+        if case and _valid_case_evidence(e, case, gate, start, now):
+            passed.add(e["case_id"])
     missing_cases = sorted(set(cases) - passed)
     missing_l0 = sorted(set(range(completed_slots)) - l0_by_slot)
     missing_l1 = sorted(set(range(completed_slots)) - l1_by_slot)
+    incident_events = read_events(state_dir / "incidents.jsonl")
+    invalidated = _critical_trial_incidents(incident_events, start, now)
     unresolved = {}
-    for e in read_events(state_dir / "incidents.jsonl"):
+    for e in incident_events:
         if e.get("incident_id"):
             unresolved[e["incident_id"]] = e
     blocking = sorted(k for k,v in unresolved.items() if v.get("state")!="VERIFIED_CLOSED"
                       and v.get("severity") in ("P0","P1"))
     good = (completed_slots==360 and len(l0_by_slot)==360 and len(l1_by_slot)==360
-            and len(daily)==15 and not missing_cases and not blocking)
+            and len(daily)==15 and not missing_cases and not blocking and not invalidated)
     return {"mode":"soak","trial_id":gate["trial_id"],
             "verdict":"READY_FOR_INDEPENDENT_REVIEW" if good else "BLOCKED",
             "hours_elapsed":round((now-start).total_seconds()/3600,2),
@@ -224,6 +268,7 @@ def evaluate(state_dir: Path, *, now=None, gate_key=None, base=HERE):
             "l1_slots":len(l1_by_slot),"daily_days":len(daily),
             "missing_l0_slots":missing_l0[:24], "missing_l1_slots":missing_l1[:24],
             "missing_case_ids":missing_cases,"unresolved_p0_p1":blocking,
+            "trial_invalidated_by":invalidated,
             "note":"READY_FOR_INDEPENDENT_REVIEW is never an automatic PASS"}
 
 
