@@ -50,7 +50,6 @@ func TestAIBOXExternalSourceFingerprintMustBeSHA256Hex(t *testing.T) {
 	}
 }
 
-
 // The catalog's tenant-wide Resolve is deliberately insufficient for a
 // source_ref in another KB. Only the explicit KB registration can authorize it.
 type aiboxScopeCatalog struct {
