@@ -140,6 +140,7 @@ func TestDerivedRevisionUpdatePersistsHistoryOnStableKnowledge(t *testing.T) {
 	require.NoError(t, fixture.db.AutoMigrate(&types.SourceRevision{}))
 	fixture.svc.task = client
 	repo := apprepo.NewKnowledgeRepository(fixture.db)
+	fixture.svc.repo = repo
 	revisions, ok := any(repo).(derivedSourceRevisionStore)
 	require.True(t, ok)
 	svc := newDerivedKnowledgeEnvelopeService(fixture.svc, revisions)
