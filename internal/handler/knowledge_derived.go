@@ -88,11 +88,11 @@ func safeAIBOXSourceResourcePath(prefix, candidate string) bool {
 // from being recorded as verified provenance. This validates syntax only:
 // independent corpus verification still has to hash the actual source bytes.
 func validAIBOXSourceSHA256(value string) bool {
-    if len(value) != 64 {
-        return false
-    }
-    _, err := hex.DecodeString(value)
-    return err == nil
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 // RegisterAIBOXExternalResource records an approved, remotely authoritative

@@ -27,19 +27,19 @@ func TestAIBOXExternalResourcePathIsConfined(t *testing.T) {
 }
 
 func TestAIBOXExternalSourceFingerprintMustBeSHA256Hex(t *testing.T) {
-    cases := []struct {
-        hash string
-        want bool
-    }{
-        {"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", true},
-        {"ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789", true},
-        {"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", false},
-        {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", false},
-        {"", false},
-    }
-    for _, tc := range cases {
-        if got := validAIBOXSourceSHA256(tc.hash); got != tc.want {
-            t.Errorf("hash length %d valid=%v, want %v", len(tc.hash), got, tc.want)
-        }
-    }
+	cases := []struct {
+		hash string
+		want bool
+	}{
+		{"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", true},
+		{"ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789", true},
+		{"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", false},
+		{"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := validAIBOXSourceSHA256(tc.hash); got != tc.want {
+			t.Errorf("hash length %d valid=%v, want %v", len(tc.hash), got, tc.want)
+		}
+	}
 }
