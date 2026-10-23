@@ -17,11 +17,19 @@ import urllib.request
 from gate_guard import validate_gate
 from soak_engine import append_event, failing_incident, now_utc
 
-API_URL = "http://172.17.0.1:18080/api/v1"
+# Only the dedicated #126 canary API. Never query the original owner UAT.
+API_URL = "http://127.0.0.1:18082/api/v1"
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        # urllib normally forwards request headers, including X-API-Key.
+        return None
+
 
 
 def secure_read(path: Path):
-    if not path.is_file() or (path.stat().st_mode & 0o077):
+    if path.is_symlink() or not path.is_file() or (path.stat().st_mode & 0o077):
         raise ValueError("token path missing or readable by others")
     value = path.read_text(encoding="utf-8").strip()
     if len(value)<16 or "\n" in value:
@@ -37,7 +45,7 @@ def api_get(resource: str, token: str, transport=None):
         return transport(url, token)
     req = urllib.request.Request(url, headers={"X-API-Key": token,
                                                 "User-Agent": "aibox-p2-readonly-soak-v1"})
-    with urllib.request.urlopen(req, timeout=12) as response:
+    with urllib.request.build_opener(NoRedirect()).open(req, timeout=12) as response:
         if response.status != 200:
             raise ValueError("knowledge API did not return 200")
         raw = response.read(2_000_001)
@@ -92,11 +100,15 @@ def knowledge_case(profile, token, transport=None):
     return results
 
 
-def run(state_dir:Path,profile_path:Path,token_file:Path,transport=None,preflight=False):
+def run(state_dir:Path,profile_path:Path,token_file:Path,transport=None,preflight=False,notify=False):
     gate, reason = validate_gate(state_dir/"gate.json")
+    if preflight:
+        # An explicitly preflight-only timer must NEVER emit a formal PASS,
+        # even after a future independent Gate is installed.
+        gate = None
     if not gate and not preflight:
         return {"result":"BLOCKED","reason":reason,"mode":"preflight"}
-    if not profile_path.is_file() or (profile_path.stat().st_mode & 0o077):
+    if profile_path.is_symlink() or not profile_path.is_file() or (profile_path.stat().st_mode & 0o077):
         return {"result":"BLOCKED","reason":"private test profile missing/insecure"}
     try:
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -121,7 +133,10 @@ def run(state_dir:Path,profile_path:Path,token_file:Path,transport=None,prefligh
                 "oracle_sha256":digest if "digest" in locals() else None,"timestamp_utc":now_utc(),
                 "error_type":type(e).__name__,"error_category":category}
         append_event(state_dir/"business.jsonl",result)
-        failing_incident(state_dir,case_id="KB01",signature=category,source_id="hourly-probe")
+        incident=failing_incident(state_dir,case_id="KB01",signature=category,source_id="hourly-probe")
+        if notify:
+            from watchdog import notify_issue_once
+            result["notification"]=notify_issue_once(state_dir,incident["incident_id"])
         return result
 
 
@@ -132,8 +147,10 @@ def main():
     p.add_argument("--read-key",type=Path,required=True)
     p.add_argument("--preflight-verify",action="store_true",
                    help="Read-only smoke before gate; never counts as a soak PASS")
+    p.add_argument("--notify",action="store_true",
+                   help="On failed read-only probe, notify #126 with a sanitized incident")
     a=p.parse_args()
-    result=run(a.state_dir,a.profile,a.read_key,preflight=a.preflight_verify)
+    result=run(a.state_dir,a.profile,a.read_key,preflight=a.preflight_verify,notify=a.notify)
     print(json.dumps(result,sort_keys=True))
     if result["result"] not in ("PASS","PRECHECK_PASS"):
         sys.exit(2)
