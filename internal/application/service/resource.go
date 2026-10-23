@@ -178,6 +178,28 @@ func (s *resourceCatalog) Bind(ctx context.Context, reference, ownerType, ownerI
 	})
 }
 
+// IsAIBOXSourceRegisteredForKB requires a server-created KB registration
+// binding; sharing a tenant or an existing Knowledge binding is insufficient.
+func (s *resourceCatalog) IsAIBOXSourceRegisteredForKB(
+	ctx context.Context, tenantID uint64, kbID, reference string,
+) (bool, error) {
+	resource, err := s.Resolve(ctx, reference)
+	if err != nil {
+		return false, err
+	}
+	if resource == nil || resource.TenantID != tenantID ||
+		resource.Ownership != types.ResourceOwnershipExternal {
+		return false, nil
+	}
+	lookup, ok := s.repo.(interface {
+		IsAIBOXSourceRegisteredForKB(context.Context, uint64, string, string) (bool, error)
+	})
+	if !ok {
+		return false, fmt.Errorf("AIBOX KB source registration lookup unavailable")
+	}
+	return lookup.IsAIBOXSourceRegisteredForKB(ctx, tenantID, kbID, resource.ID)
+}
+
 func (s *resourceCatalog) IsReferencedByKnowledgeBase(
 	ctx context.Context,
 	tenantID uint64,

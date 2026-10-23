@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/hex"
 	"net/http"
 	"os"
@@ -54,6 +55,15 @@ func (h *KnowledgeHandler) UpsertDerivedKnowledge(c *gin.Context) {
 			_ = c.Error(errors.NewBadRequestError("Unregistered, managed or cross-tenant source resource"))
 			return
 		}
+		registered, scopeErr := aiboxSourceRegisteredForKB(ctx, h.aiboxResources, tenantID, kbID, envelope.SourceResourceRef)
+		if scopeErr != nil {
+			_ = c.Error(errors.NewInternalServerError("AIBOX source scope check unavailable"))
+			return
+		}
+		if !registered {
+			_ = c.Error(errors.NewBadRequestError("Source resource is not registered for target KB"))
+			return
+		}
 	}
 	saved, err := service.NewDerivedKnowledgeEnvelopeService(h.kgService).Upsert(ctx, kbID, &envelope)
 	if err != nil {
@@ -67,6 +77,18 @@ func (h *KnowledgeHandler) UpsertDerivedKnowledge(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": saved})
+}
+
+// aiboxSourceRegisteredForKB fails closed when the catalog cannot prove
+// an explicit source registration for this exact tenant and knowledge base.
+func aiboxSourceRegisteredForKB(
+	ctx context.Context, catalog interfaces.ResourceCatalog, tenantID uint64, kbID, ref string,
+) (bool, error) {
+	lookup, ok := catalog.(interfaces.AIBOXKBSourceLookup)
+	if !ok {
+		return false, errors.NewInternalServerError("AIBOX KB scope lookup unavailable")
+	}
+	return lookup.IsAIBOXSourceRegisteredForKB(ctx, tenantID, kbID, ref)
 }
 
 // safeAIBOXSourceResourcePath accepts only relative clean paths beneath an
@@ -98,7 +120,7 @@ func validAIBOXSourceSHA256(value string) bool {
 // RegisterAIBOXExternalResource records an approved, remotely authoritative
 // raw object without uploading or copying bytes into WeKnora storage.
 func (h *KnowledgeHandler) RegisterAIBOXExternalResource(c *gin.Context) {
-	_, _, tenantID, permission, err := h.validateKnowledgeBaseAccess(c)
+	_, kbID, tenantID, permission, err := h.validateKnowledgeBaseAccess(c)
 	if err != nil {
 		_ = c.Error(err)
 		return
@@ -140,6 +162,24 @@ func (h *KnowledgeHandler) RegisterAIBOXExternalResource(c *gin.Context) {
 	if err != nil {
 		_ = c.Error(errors.NewInternalServerError("External registration failed"))
 		return
+	}
+	// Explicit KB scope: a resource in the same tenant is not automatically
+	// a source for every KB. Retrying after a binding error is safe.
+	lookup, ok := h.aiboxResources.(interfaces.AIBOXKBSourceLookup)
+	if !ok {
+		_ = c.Error(errors.NewInternalServerError("AIBOX source scope lookup unavailable"))
+		return
+	}
+	registered, checkErr := lookup.IsAIBOXSourceRegisteredForKB(ctx, tenantID, kbID, ref)
+	if checkErr != nil {
+		_ = c.Error(errors.NewInternalServerError("External registration scope check failed"))
+		return
+	}
+	if !registered {
+		if err := h.aiboxResources.Bind(ctx, ref, types.ResourceOwnerKnowledgeBase, kbID, types.ResourceRelationAIBOXSource); err != nil {
+			_ = c.Error(errors.NewInternalServerError("External source KB binding failed"))
+			return
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"resource_ref": ref, "ownership": "external"}})
 }

@@ -55,3 +55,20 @@ func (r *resourceRepository) GetMessageFileBindings(
 	}
 	return result, nil
 }
+
+
+// IsAIBOXSourceRegisteredForKB checks the explicit registration binding.
+// A tenant-wide resource handle does not grant access in another KB.
+func (r *resourceRepository) IsAIBOXSourceRegisteredForKB(
+	ctx context.Context, tenantID uint64, kbID, resourceID string,
+) (bool, error) {
+	if tenantID == 0 || kbID == "" || resourceID == "" {
+		return false, nil
+	}
+	var count int64
+	err := r.db.WithContext(ctx).Model(&types.ResourceBinding{}).
+		Where("resource_id = ? AND tenant_id = ? AND owner_type = ? AND owner_id = ? AND relation = ?",
+			resourceID, tenantID, types.ResourceOwnerKnowledgeBase, kbID, types.ResourceRelationAIBOXSource).
+		Count(&count).Error
+	return count > 0, err
+}
