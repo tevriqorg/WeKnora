@@ -125,3 +125,40 @@ func TestApplyDerivedSourceLocatorsCopiesTimeEvidence(t *testing.T) {
 	require.Equal(t, "e1", parsed[1].SourceLocators[0].SourceID)
 	require.Equal(t, int64(200), parents[0].SourceLocators[0].EndMs)
 }
+
+// #126: content revisions and processor upgrades must not change source identity.
+func TestDerivedSourceRevisionAndProcessorKeepStableKnowledge(t *testing.T) {
+	writer := newDerivedWriterFixture()
+	revisions := &derivedRevisionFixture{}
+	svc := newDerivedKnowledgeEnvelopeService(writer, revisions)
+	ctx := types.WithExecutionTenant(context.Background(), 7)
+	first, err := svc.Upsert(ctx, "kb-1", derivedEnvelope("ready"))
+	require.NoError(t, err)
+	firstID := first.ID
+	changed := derivedEnvelope("ready")
+	changed.SourceRevisionID = "rev-2"
+	changed.Markdown = "person leaves"
+	second, err := svc.Upsert(ctx, "kb-1", changed)
+	require.NoError(t, err)
+	require.Equal(t, firstID, second.ID, "source content update created a different Knowledge")
+	upgraded := derivedEnvelope("ready")
+	upgraded.SourceRevisionID = "rev-2"
+	upgraded.ProcessorVersion = "consumer-api-v3"
+	third, err := svc.Upsert(ctx, "kb-1", upgraded)
+	require.NoError(t, err)
+	require.Equal(t, firstID, third.ID, "processor upgrade created a different Knowledge")
+	require.Equal(t, 1, writer.creates)
+}
+
+func TestDerivedDistinctSourcesDoNotAliasSameRevision(t *testing.T) {
+	writer := newDerivedWriterFixture()
+	svc := newDerivedKnowledgeEnvelopeService(writer, &derivedRevisionFixture{})
+	ctx := types.WithExecutionTenant(context.Background(), 7)
+	first, err := svc.Upsert(ctx, "kb-1", derivedEnvelope("ready"))
+	require.NoError(t, err)
+	other := derivedEnvelope("ready")
+	other.SourceKey = "public:another-source"
+	second, err := svc.Upsert(ctx, "kb-1", other)
+	require.NoError(t, err)
+	require.NotEqual(t, first.ID, second.ID, "distinct sources with identical revision labels were merged")
+}
