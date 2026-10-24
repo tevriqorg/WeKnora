@@ -16,9 +16,10 @@ func newTemporalRepoForTest(t *testing.T) (*TemporalRepository, *gorm.DB) {
 	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
+		&types.Knowledge{},
 		&types.TemporalGraphGeneration{},
 		&types.TemporalEpisodeBinding{},
-		&types.TemporalTransitionBinding{},
+		&types.TemporalTransitionBinding{}, &types.TemporalFinalizeReceipt{},
 	))
 	return NewTemporalRepository(db), db
 }
@@ -80,4 +81,50 @@ func TestTemporalTransitionsAreReplayIdempotent(t *testing.T) {
 	var count int64
 	require.NoError(t, db.Model(&types.TemporalTransitionBinding{}).Count(&count).Error)
 	require.EqualValues(t, 1, count)
+}
+
+
+// A delayed adapter response must not overwrite a newer snapshot's projection.
+// Re-publishing the exact old snapshot later is allowed (legitimate rollback).
+func TestTemporalDerivedSnapshotFenceRejectsLateWriteAndAllowsRollback(t *testing.T) {
+	repo, db := newTemporalRepoForTest(t)
+	ctx := context.Background()
+	knowledge := &types.Knowledge{ID: "kn-1", TenantID: 7, KnowledgeBaseID: "kb-1"}
+	require.NoError(t, knowledge.SetDerivedMetadata(&types.DerivedKnowledgeMetadata{SnapshotHash: "v1"}))
+	require.NoError(t, db.Create(knowledge).Error)
+	binding := &types.TemporalEpisodeBinding{
+		EpisodeUUID: "ep-v1", GenerationID: "gen-1", GroupID: "group-1",
+		KnowledgeID: "kn-1", SourceRevisionID: "rev-1", SourceKind: "text",
+		AuthorityKey: "knowledge:kn-1", SnapshotHash: "window-v1",
+		TemporalStatus: types.TemporalStatusRunning,
+	}
+	require.NoError(t, repo.UpsertEpisodeBindingForDerivedSnapshot(ctx, 7, "kn-1", "v1", binding))
+	require.NoError(t, knowledge.SetDerivedMetadata(&types.DerivedKnowledgeMetadata{SnapshotHash: "v2"}))
+	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "kn-1").
+		Update("metadata", knowledge.Metadata).Error)
+	require.NoError(t, repo.MarkSupersededEpisodeBindingsForDerivedSnapshot(
+		ctx, 7, "kn-1", "v2", "gen-1", "rev-1", nil))
+	binding.TemporalStatus = types.TemporalStatusReady
+	require.ErrorIs(t, repo.CommitEpisodeForDerivedSnapshot(ctx, 7, "kn-1", "v1", binding,
+		[]types.TemporalTransitionBinding{{
+			GenerationID: "gen-1", OldFactUUID: "old", NewFactUUID: "new",
+			CausingEpisodeUUID: "ep-v1", TransitionType: "invalidated",
+		}}), ErrTemporalSnapshotSuperseded)
+	require.ErrorIs(t, repo.MarkSupersededEpisodeBindingsForDerivedSnapshot(
+		ctx, 7, "kn-1", "v1", "gen-1", "rev-1", nil), ErrTemporalSnapshotSuperseded)
+	stored, err := repo.GetEpisodeBinding(ctx, "gen-1", "ep-v1")
+	require.NoError(t, err)
+	require.Equal(t, types.TemporalStatusStale, stored.TemporalStatus)
+	var transitions int64
+	require.NoError(t, db.Model(&types.TemporalTransitionBinding{}).Count(&transitions).Error)
+	require.Zero(t, transitions, "superseded adapter must not commit transitions")
+
+	// A later deliberate rollback of the source snapshot can reprocess v1.
+	require.NoError(t, knowledge.SetDerivedMetadata(&types.DerivedKnowledgeMetadata{SnapshotHash: "v1"}))
+	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "kn-1").
+		Update("metadata", knowledge.Metadata).Error)
+	require.NoError(t, repo.UpsertEpisodeBindingForDerivedSnapshot(ctx, 7, "kn-1", "v1", binding))
+	stored, err = repo.GetEpisodeBinding(ctx, "gen-1", "ep-v1")
+	require.NoError(t, err)
+	require.Equal(t, types.TemporalStatusReady, stored.TemporalStatus)
 }

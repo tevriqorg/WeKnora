@@ -146,3 +146,72 @@ func TestG7BackfillPayloadUsesExistingTemporalQueue(t *testing.T) {
 	require.NoError(t, json.Unmarshal(tasks.tasks[0].Payload(), &p))
 	require.Equal(t, "k", p.KnowledgeID)
 }
+
+func TestG7DerivedSnapshotReadyUsesWorkerEpisodeIdentity(t *testing.T) {
+	svc, db, tasks := newMigrationFixture(t)
+	ctx := context.Background()
+	require.NoError(t, db.Create(&types.KnowledgeBase{ID: "kb-1", TenantID: 7, Name: "KB"}).Error)
+	k := &types.Knowledge{ID: "kn-1", TenantID: 7, KnowledgeBaseID: "kb-1", Type: "file", FileName: "a.pdf", FileType: "pdf", FileHash: "abc", ParseStatus: types.ParseStatusCompleted, EnableStatus: "enabled"}
+	require.NoError(t, k.SetDerivedMetadata(&types.DerivedKnowledgeMetadata{
+		SnapshotHash: "derived-v1", SourceRevisionID: "native-unchanged",
+	}))
+	require.NoError(t, db.Create(k).Error)
+	require.NoError(t, db.Create(&types.Chunk{ID: "c1", TenantID: 7, KnowledgeID: "kn-1", KnowledgeBaseID: "kb-1", Content: "Alice works at Acme.", ChunkIndex: 0, IsEnabled: true, ChunkType: types.ChunkTypeText}).Error)
+	report, err := svc.Prepare(ctx, migrationConfig())
+	require.NoError(t, err)
+	require.Empty(t, report.Blocked)
+	require.Len(t, tasks.tasks, 1)
+	var payload types.TemporalEnrichmentPayload
+	require.NoError(t, json.Unmarshal(tasks.tasks[0].Payload(), &payload))
+	require.Equal(t, "derived-v1", payload.SnapshotHash)
+	require.False(t, payload.FinalizesSlot)
+	var rev types.SourceRevision
+	require.NoError(t, db.First(&rev, "knowledge_id = ?", "kn-1").Error)
+	var gen types.TemporalGraphGeneration
+	require.NoError(t, db.First(&gen, "knowledge_base_id = ?", "kb-1").Error)
+	chunks, err := svc.chunkRepo.ListChunksByKnowledgeIDAndTypes(ctx, 7, "kn-1", []types.ChunkType{types.ChunkTypeText})
+	require.NoError(t, err)
+	windows, err := buildTemporalEvidenceWindows(chunks, defaultTemporalWindowChars)
+	require.NoError(t, err)
+	require.NotEmpty(t, windows)
+	for _, w := range windows {
+		ep, err := deterministicDerivedTemporalEpisodeUUID("kn-1", rev.RevisionID, gen.GenerationID, w.Ordinal, "derived-v1")
+		require.NoError(t, err)
+		ord := w.Ordinal
+		require.NoError(t, db.Create(&types.TemporalEpisodeBinding{
+			EpisodeUUID: ep, GenerationID: gen.GenerationID, GroupID: gen.GroupID,
+			KnowledgeID: "kn-1", SourceRevisionID: rev.RevisionID, WindowOrdinal: &ord,
+			ReferenceTime: time.Now(), SourceKind: "text", AuthorityKey: "knowledge:kn-1",
+			EvidenceSnapshot: w.Content, SnapshotHash: w.SnapshotHash,
+			ExtractionSchemaVersion: gen.ExtractionSchemaVersion,
+			ModelConfigFingerprint: gen.ModelConfigFingerprint, TemporalStatus: types.TemporalStatusReady,
+		}).Error)
+	}
+	pre, err := svc.Preflight(ctx, migrationConfig())
+	require.NoError(t, err)
+	require.Empty(t, pre.Blocked, "derived snapshot already has ready worker bindings")
+	require.Equal(t, 1, pre.BackfillReady)
+	again, err := svc.Prepare(ctx, migrationConfig())
+	require.NoError(t, err)
+	require.Zero(t, again.BackfillEnqueued, "ready derived binding must not be requeued")
+	require.Equal(t, 1, again.BackfillReady)
+
+	// A native UUID must not falsely certify a derived snapshot as ready.
+	require.NoError(t, db.Where("knowledge_id = ?", "kn-1").Delete(&types.TemporalEpisodeBinding{}).Error)
+	for _, w := range windows {
+		ep, err := deterministicTemporalEpisodeUUID("kn-1", rev.RevisionID, gen.GenerationID, w.Ordinal)
+		require.NoError(t, err)
+		ord := w.Ordinal
+		require.NoError(t, db.Create(&types.TemporalEpisodeBinding{
+			EpisodeUUID: ep, GenerationID: gen.GenerationID, GroupID: gen.GroupID,
+			KnowledgeID: "kn-1", SourceRevisionID: rev.RevisionID, WindowOrdinal: &ord,
+			ReferenceTime: time.Now(), SourceKind: "text", AuthorityKey: "knowledge:kn-1",
+			EvidenceSnapshot: w.Content, SnapshotHash: w.SnapshotHash,
+			ExtractionSchemaVersion: gen.ExtractionSchemaVersion,
+			ModelConfigFingerprint: gen.ModelConfigFingerprint, TemporalStatus: types.TemporalStatusReady,
+		}).Error)
+	}
+	pre, err = svc.Preflight(ctx, migrationConfig())
+	require.NoError(t, err)
+	require.Contains(t, pre.Blocked, "knowledge:kn-1:temporal-backfill-incomplete")
+}

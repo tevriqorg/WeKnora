@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -49,8 +50,13 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 		return nil
 	}
 	defer func() {
-		finalizeSubtaskDetached(ctx, s.knowledgeRepo, payload.KnowledgeID, "temporal",
-			retErr, false, isFinalAsynqAttempt(ctx))
+		if !payload.FinalizesSlot || (retErr != nil && !isFinalAsynqAttempt(ctx)) ||
+			attemptSuperseded(ctx, s.tracker, payload.KnowledgeID, payload.Attempt) {
+			return
+		}
+		if err := releaseTemporalSnapshotSubtaskSlot(ctx, s.temporalRepo, payload); err != nil {
+			logger.Errorf(ctx, "temporal finalize slot failed knowledge=%s: %v", payload.KnowledgeID, err)
+		}
 	}()
 
 	generation, err := s.temporalRepo.GetActiveGeneration(ctx, payload.TenantID, payload.KnowledgeBaseID)
@@ -69,6 +75,22 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 		logger.Warnf(ctx, "temporal: no current SourceRevision for knowledge=%s; leaving temporal state degraded", payload.KnowledgeID)
 		return nil
 	}
+	knowledge, err := s.knowledgeRepo.GetKnowledgeByID(ctx, payload.TenantID, payload.KnowledgeID)
+	if err != nil {
+		return fmt.Errorf("get temporal knowledge metadata: %w", err)
+	}
+	derived, err := knowledge.DerivedMetadata()
+	if err != nil {
+		return fmt.Errorf("read temporal derived snapshot: %w", err)
+	}
+	if derived != nil && derived.SnapshotHash == "" {
+		return fmt.Errorf("derived temporal snapshot hash missing")
+	}
+	if (derived != nil && payload.SnapshotHash != derived.SnapshotHash) ||
+		(derived == nil && payload.SnapshotHash != "") {
+		logger.Infof(ctx, "temporal: snapshot token no longer owns knowledge=%s, skipping", payload.KnowledgeID)
+		return nil
+	}
 	chunks, err := s.chunkRepo.ListChunksByKnowledgeIDAndTypes(ctx, payload.TenantID, payload.KnowledgeID,
 		[]types.ChunkType{types.ChunkTypeText, types.ChunkTypeImageOCR, types.ChunkTypeImageCaption})
 	if err != nil {
@@ -77,6 +99,28 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 	windows, err := buildTemporalEvidenceWindows(chunks, defaultTemporalWindowChars)
 	if err != nil {
 		return fmt.Errorf("build temporal evidence windows: %w", err)
+	}
+	episodeIDs := make([]string, len(windows))
+	for i, window := range windows {
+		episodeID, err := deterministicTemporalEpisodeUUIDForSnapshot(
+			payload.KnowledgeID, revision.RevisionID, generation.GenerationID, window.Ordinal, payload.SnapshotHash)
+		if err != nil {
+			return err
+		}
+		episodeIDs[i] = episodeID
+	}
+	if derived != nil {
+		// Invalidation is also fenced: an old worker cannot stale a newer
+		// snapshot's bindings after publication.
+		if err := s.temporalRepo.MarkSupersededEpisodeBindingsForDerivedSnapshot(
+			ctx, payload.TenantID, payload.KnowledgeID, derived.SnapshotHash,
+			generation.GenerationID, revision.RevisionID, episodeIDs,
+		); err != nil {
+			if errors.Is(err, apprepo.ErrTemporalSnapshotSuperseded) {
+				return nil
+			}
+			return fmt.Errorf("invalidate stale derived temporal bindings: %w", err)
+		}
 	}
 	if len(windows) == 0 {
 		logger.Infof(ctx, "temporal: no evidence windows for knowledge=%s", payload.KnowledgeID)
@@ -89,15 +133,19 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 	retryCount, _ := asynq.GetRetryCount(ctx)
 	temporalAttempt := retryCount + 1
 	finalAttempt := isFinalAsynqAttempt(ctx)
+	persistBinding := func(writeCtx context.Context, binding *types.TemporalEpisodeBinding) error {
+		if derived != nil {
+			return s.temporalRepo.UpsertEpisodeBindingForDerivedSnapshot(
+				writeCtx, payload.TenantID, payload.KnowledgeID, derived.SnapshotHash, binding)
+		}
+		return s.temporalRepo.UpsertEpisodeBinding(writeCtx, binding)
+	}
 	previousEpisodeUUIDs := make([]string, 0, len(windows))
 	referenceTime := temporalReferenceTime(revision)
 	authorityKey := "knowledge:" + payload.KnowledgeID
 
-	for _, window := range windows {
-		episodeUUID, err := deterministicTemporalEpisodeUUID(payload.KnowledgeID, revision.RevisionID, generation.GenerationID, window.Ordinal)
-		if err != nil {
-			return err
-		}
+	for i, window := range windows {
+		episodeUUID := episodeIDs[i]
 		existing, err := s.temporalRepo.GetEpisodeBinding(ctx, generation.GenerationID, episodeUUID)
 		if err != nil {
 			return fmt.Errorf("get temporal episode binding: %w", err)
@@ -130,7 +178,10 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 		binding.TemporalStatus = types.TemporalStatusRunning
 		binding.TemporalAttempt = temporalAttempt
 		binding.LastError = ""
-		if err := s.temporalRepo.UpsertEpisodeBinding(ctx, binding); err != nil {
+		if err := persistBinding(ctx, binding); err != nil {
+			if errors.Is(err, apprepo.ErrTemporalSnapshotSuperseded) {
+				return nil
+			}
 			return fmt.Errorf("persist running temporal binding: %w", err)
 		}
 
@@ -158,7 +209,9 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 			} else {
 				binding.TemporalStatus = types.TemporalStatusRunning
 			}
-			_ = s.temporalRepo.UpsertEpisodeBinding(context.WithoutCancel(ctx), binding)
+			if persistErr := persistBinding(context.WithoutCancel(ctx), binding); errors.Is(persistErr, apprepo.ErrTemporalSnapshotSuperseded) {
+				return nil
+			}
 			return fmt.Errorf("upsert temporal episode %s: %w", episodeUUID, err)
 		}
 
@@ -180,17 +233,58 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 		// ready. If this write fails, the binding remains running; a retry uses
 		// the deterministic Episode UUID and Graphiti's Episode receipt to rebuild
 		// these rows without re-running extraction.
-		if err := s.temporalRepo.InsertTransitions(ctx, transitions); err != nil {
-			return fmt.Errorf("persist temporal transitions: %w", err)
-		}
 		binding.TemporalStatus = types.TemporalStatusReady
 		binding.TemporalAttempt = temporalAttempt
 		binding.CompletedAt = &now
 		binding.LastError = ""
-		if err := s.temporalRepo.UpsertEpisodeBinding(ctx, binding); err != nil {
-			return fmt.Errorf("persist ready temporal binding: %w", err)
+		if derived != nil {
+			// Keep transitions and ready acknowledgement in one snapshot-
+			// fenced transaction. The adapter call itself is not a DB lock.
+			err = s.temporalRepo.CommitEpisodeForDerivedSnapshot(
+				ctx, payload.TenantID, payload.KnowledgeID, derived.SnapshotHash, binding, transitions)
+		} else {
+			err = s.temporalRepo.InsertTransitions(ctx, transitions)
+			if err == nil {
+				err = persistBinding(ctx, binding)
+			}
+		}
+		if err != nil {
+			if errors.Is(err, apprepo.ErrTemporalSnapshotSuperseded) {
+				return nil
+			}
+			return fmt.Errorf("persist temporal transition/ready binding: %w", err)
 		}
 		previousEpisodeUUIDs = append(previousEpisodeUUIDs, episodeUUID)
 	}
 	return nil
+}
+
+
+// releaseTemporalSnapshotSubtaskSlot retries a bounded detached release.
+// Superseded snapshots are terminal no-ops, never successful decrements.
+func releaseTemporalSnapshotSubtaskSlot(
+	ctx context.Context, repo *apprepo.TemporalRepository, payload types.TemporalEnrichmentPayload,
+) error {
+	if repo == nil {
+		return errors.New("temporal repository missing for finalize")
+	}
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeSubtaskDetachedTimeout)
+	defer cancel()
+	var lastErr error
+	for attempt := 1; attempt <= subtaskSlotReleaseAttempts; attempt++ {
+		err := repo.FinalizeSubtaskForSnapshot(dctx, payload.TenantID, payload.KnowledgeID, payload.SnapshotHash, payload.FinalizingBatchID)
+		if err == nil || errors.Is(err, apprepo.ErrTemporalSnapshotSuperseded) {
+			return nil
+		}
+		lastErr = err
+		if attempt == subtaskSlotReleaseAttempts {
+			break
+		}
+		select {
+		case <-time.After(time.Duration(attempt) * subtaskSlotReleaseBackoff):
+		case <-dctx.Done():
+			return fmt.Errorf("%w (last error: %v)", dctx.Err(), lastErr)
+		}
+	}
+	return lastErr
 }

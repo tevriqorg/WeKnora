@@ -48,6 +48,16 @@ type documentKnowledgeSpy struct {
 	writes int
 }
 
+// Preserve the batch-aware handoff when this test spy decorates the real
+// repository; an embedded interface alone does not expose optional methods.
+func (r *documentKnowledgeSpy) SetFinalizingWithBatch(ctx context.Context, id string, count int, batchID string) (bool, error) {
+    seeder, ok := r.KnowledgeRepository.(interface {
+        SetFinalizingWithBatch(context.Context, string, int, string) (bool, error)
+    })
+    if !ok { return false, errors.New("batch-aware finalizing not supported") }
+    return seeder.SetFinalizingWithBatch(ctx, id, count, batchID)
+}
+
 func (r *documentKnowledgeSpy) UpdateKnowledge(ctx context.Context, k *types.Knowledge) error {
 	r.writes++
 	return r.KnowledgeRepository.UpdateKnowledge(ctx, k)

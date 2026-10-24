@@ -81,11 +81,18 @@ func (r *knowledgeRepository) RollbackSourceRevision(ctx context.Context, knowle
 	}
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var rev types.SourceRevision
-		if err := tx.Where("knowledge_id = ? AND revision_id = ?", knowledgeID, revisionID).First(&rev).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("knowledge_id = ? AND revision_id = ?", knowledgeID, revisionID).First(&rev).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil
 			}
 			return err
+		}
+		// A newer concurrent publication may have superseded this staged
+		// revision. Never delete a historical row or restore an older current
+		// pointer from an obsolete rollback request.
+		if !rev.IsCurrent {
+			return errors.New("cannot rollback a superseded source revision")
 		}
 		if err := tx.Delete(&types.SourceRevision{}, "revision_id = ?", revisionID).Error; err != nil {
 			return err

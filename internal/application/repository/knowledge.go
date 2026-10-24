@@ -10,6 +10,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -41,7 +42,7 @@ func escapeLikeKeyword(keyword string) string {
 // counter jump back up and never reach zero (the "stuck
 // pending_subtasks_count / never promoted to completed" bug). Omitting
 // the column here means Save can never touch it.
-var omitFieldsOnUpdate = []string{"DeletedAt", "PendingSubtasksCount"}
+var omitFieldsOnUpdate = []string{"DeletedAt", "PendingSubtasksCount", "FinalizingBatchID"}
 
 // knowledgeRepository implements knowledge base and knowledge repository interface
 type knowledgeRepository struct {
@@ -758,6 +759,14 @@ func finalizeSubtask(db *gorm.DB, id string) (bool, error) {
 func (r *knowledgeRepository) SetFinalizing(
 	ctx context.Context, id string, expectedSubtasks int,
 ) (bool, error) {
+	return r.SetFinalizingWithBatch(ctx, id, expectedSubtasks, uuid.NewString())
+}
+
+// SetFinalizingWithBatch persists the caller-selected owner atomically with the counter.
+func (r *knowledgeRepository) SetFinalizingWithBatch(
+	ctx context.Context, id string, expectedSubtasks int, batchID string,
+) (bool, error) {
+	if batchID == "" { return false, errors.New("finalizing batch owner required") }
 	if expectedSubtasks < 0 {
 		expectedSubtasks = 0
 	}
@@ -767,6 +776,7 @@ func (r *knowledgeRepository) SetFinalizing(
 		Updates(map[string]interface{}{
 			"parse_status":           types.ParseStatusFinalizing,
 			"pending_subtasks_count": expectedSubtasks,
+			"finalizing_batch_id": batchID,
 			"error_message":          "",
 			"updated_at":             now,
 		})

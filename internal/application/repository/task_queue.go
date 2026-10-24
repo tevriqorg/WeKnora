@@ -9,6 +9,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -129,11 +130,17 @@ func (r *taskPendingOpsRepository) HasActiveTenant(ctx context.Context, tenantID
 // the crash window where a knowledge row could enter finalizing before its
 // Wiki operation existed.
 func (r *taskPendingOpsRepository) SeedKnowledgeFinalizingWithPendingOp(
-	ctx context.Context,
-	knowledgeID string,
-	expectedSubtasks int,
-	op *types.TaskPendingOp,
+	ctx context.Context, knowledgeID string, expectedSubtasks int, op *types.TaskPendingOp,
 ) (bool, error) {
+	return r.SeedKnowledgeFinalizingWithPendingOpWithBatch(ctx, knowledgeID, expectedSubtasks, op, uuid.NewString())
+}
+
+// SeedKnowledgeFinalizingWithPendingOpWithBatch also persists the batch owner
+// in the same transaction as the Wiki pending op and finalizing counter.
+func (r *taskPendingOpsRepository) SeedKnowledgeFinalizingWithPendingOpWithBatch(
+	ctx context.Context, knowledgeID string, expectedSubtasks int, op *types.TaskPendingOp, batchID string,
+) (bool, error) {
+	if batchID == "" { return false, errors.New("finalizing batch owner required") }
 	if knowledgeID == "" {
 		return false, errors.New("task pending ops: knowledge_id is required")
 	}
@@ -171,6 +178,7 @@ func (r *taskPendingOpsRepository) SeedKnowledgeFinalizingWithPendingOp(
 			Updates(map[string]interface{}{
 				"parse_status":           types.ParseStatusFinalizing,
 				"pending_subtasks_count": expectedSubtasks,
+				"finalizing_batch_id": batchID,
 				"updated_at":             time.Now(),
 			})
 		if res.Error != nil {

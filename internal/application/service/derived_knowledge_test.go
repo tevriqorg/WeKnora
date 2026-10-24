@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ type derivedWriterFixture struct {
 	rows             map[string]*types.Knowledge
 	creates, updates int
 	lastPayload      *types.ManualKnowledgePayload
+	updateErr        error
 }
 
 func newDerivedWriterFixture() *derivedWriterFixture {
@@ -41,6 +44,9 @@ func (f *derivedWriterFixture) CreateKnowledgeFromManual(_ context.Context, kbID
 }
 func (f *derivedWriterFixture) UpdateManualKnowledge(_ context.Context, id string, p *types.ManualKnowledgePayload) (*types.Knowledge, error) {
 	f.updates++
+	if f.updateErr != nil {
+		return nil, f.updateErr
+	}
 	f.lastPayload = p
 	k := f.rows[id]
 	_ = k.SetManualMetadata(types.NewManualKnowledgeMetadata(p.Content, p.Status, 2))
@@ -54,18 +60,38 @@ func (f *derivedWriterFixture) UpdateManualKnowledge(_ context.Context, id strin
 }
 
 type derivedRevisionFixture struct {
-	calls int
-	last  *types.SourceRevision
+	calls     int
+	last      *types.SourceRevision
+	history   []*types.SourceRevision
+	rollbacks int
 }
 
 func (f *derivedRevisionFixture) UpsertSourceRevision(_ context.Context, r *types.SourceRevision) (*types.SourceRevision, bool, error) {
 	f.calls++
 	copy := *r
-	if copy.RevisionID == "" {
-		copy.RevisionID = "internal-rev"
+	created := f.last == nil || f.last.NativeVersion != copy.NativeVersion
+	if created {
+		copy.RevisionID = "internal-rev-" + copy.NativeVersion
+		f.history = append(f.history, &copy)
+	} else {
+		copy.RevisionID = f.last.RevisionID
+		f.history[len(f.history)-1] = &copy
 	}
 	f.last = &copy
-	return &copy, f.calls == 1, nil
+	return &copy, created, nil
+}
+
+func (f *derivedRevisionFixture) RollbackSourceRevision(_ context.Context, knowledgeID, revisionID string) error {
+	if f.last == nil || f.last.RevisionID != revisionID || f.last.KnowledgeID != knowledgeID {
+		return errors.New("cannot rollback superseded revision")
+	}
+	f.rollbacks++
+	f.history = f.history[:len(f.history)-1]
+	f.last = nil
+	if len(f.history) != 0 {
+		f.last = f.history[len(f.history)-1]
+	}
+	return nil
 }
 
 func derivedEnvelope(status string) *types.DerivedKnowledgeEnvelope {
@@ -124,4 +150,89 @@ func TestApplyDerivedSourceLocatorsCopiesTimeEvidence(t *testing.T) {
 	require.Equal(t, int64(100), parsed[0].SourceLocators[0].StartMs)
 	require.Equal(t, "e1", parsed[1].SourceLocators[0].SourceID)
 	require.Equal(t, int64(200), parents[0].SourceLocators[0].EndMs)
+}
+
+// #126: content revisions and processor upgrades must not change source identity.
+func TestDerivedSourceRevisionAndProcessorKeepStableKnowledge(t *testing.T) {
+	writer := newDerivedWriterFixture()
+	revisions := &derivedRevisionFixture{}
+	svc := newDerivedKnowledgeEnvelopeService(writer, revisions)
+	ctx := types.WithExecutionTenant(context.Background(), 7)
+	first, err := svc.Upsert(ctx, "kb-1", derivedEnvelope("ready"))
+	require.NoError(t, err)
+	firstID := first.ID
+	changed := derivedEnvelope("ready")
+	changed.SourceRevisionID = "rev-2"
+	changed.Markdown = "person leaves"
+	second, err := svc.Upsert(ctx, "kb-1", changed)
+	require.NoError(t, err)
+	require.Equal(t, firstID, second.ID, "source content update created a different Knowledge")
+	upgraded := derivedEnvelope("ready")
+	upgraded.SourceRevisionID = "rev-2"
+	upgraded.ProcessorVersion = "consumer-api-v3"
+	third, err := svc.Upsert(ctx, "kb-1", upgraded)
+	require.NoError(t, err)
+	require.Equal(t, firstID, third.ID, "processor upgrade created a different Knowledge")
+	require.Equal(t, 1, writer.creates)
+}
+
+func TestDerivedDistinctSourcesDoNotAliasSameRevision(t *testing.T) {
+	writer := newDerivedWriterFixture()
+	svc := newDerivedKnowledgeEnvelopeService(writer, &derivedRevisionFixture{})
+	ctx := types.WithExecutionTenant(context.Background(), 7)
+	first, err := svc.Upsert(ctx, "kb-1", derivedEnvelope("ready"))
+	require.NoError(t, err)
+	other := derivedEnvelope("ready")
+	other.SourceKey = "public:another-source"
+	second, err := svc.Upsert(ctx, "kb-1", other)
+	require.NoError(t, err)
+	require.NotEqual(t, first.ID, second.ID, "distinct sources with identical revision labels were merged")
+}
+
+// #126 Codex finding 4365682879: a rejected revision must not replace the
+// currently published source reality (or enqueue an update for stale chunks).
+func TestDerivedRejectedOversizeRevisionKeepsCurrentSource(t *testing.T) {
+	writer := newDerivedWriterFixture()
+	revisions := &derivedRevisionFixture{}
+	svc := newDerivedKnowledgeEnvelopeService(writer, revisions)
+	ctx := types.WithExecutionTenant(context.Background(), 7)
+	original, err := svc.Upsert(ctx, "kb-1", derivedEnvelope("ready"))
+	require.NoError(t, err)
+	originalMeta, err := original.DerivedMetadata()
+	require.NoError(t, err)
+	require.Equal(t, "rev-1", revisions.last.NativeVersion)
+
+	rejected := derivedEnvelope("ready")
+	rejected.SourceRevisionID = "rev-2"
+	rejected.Markdown = strings.Repeat("x", manualContentMaxLength+1)
+	_, err = svc.Upsert(ctx, "kb-1", rejected)
+	require.Error(t, err, "oversize update must be rejected")
+	require.Equal(t, 1, revisions.calls, "rejected revision must not become current")
+	require.Equal(t, "rev-1", revisions.last.NativeVersion)
+	require.Equal(t, 1, writer.updates, "rejected revision must not publish")
+	stored, err := writer.rows[original.ID].DerivedMetadata()
+	require.NoError(t, err)
+	require.Equal(t, originalMeta.SnapshotHash, stored.SnapshotHash)
+}
+
+// #126 Codex finding 4365682879: a downstream publication failure after
+// successful preflight must restore the previous current SourceRevision.
+func TestDerivedFailedPublicationRollsBackSourceRevision(t *testing.T) {
+	writer := newDerivedWriterFixture()
+	revisions := &derivedRevisionFixture{}
+	svc := newDerivedKnowledgeEnvelopeService(writer, revisions)
+	ctx := types.WithExecutionTenant(context.Background(), 7)
+	_, err := svc.Upsert(ctx, "kb-1", derivedEnvelope("ready"))
+	require.NoError(t, err)
+	require.Equal(t, "rev-1", revisions.last.NativeVersion)
+
+	writer.updateErr = errors.New("injected downstream publish failure")
+	failed := derivedEnvelope("ready")
+	failed.SourceRevisionID = "rev-2"
+	failed.Markdown = "new content"
+	_, err = svc.Upsert(ctx, "kb-1", failed)
+	require.ErrorContains(t, err, "injected downstream publish failure")
+	require.Equal(t, "rev-1", revisions.last.NativeVersion,
+		"failed publish must not leave v2 as current source reality")
+	require.Equal(t, 1, revisions.rollbacks, "publication failure must invoke durable rollback")
 }

@@ -37,3 +37,11 @@ func TestDerivedMetadataSurvivesManualMetadataRewrite(t *testing.T) {
 	require.Equal(t, "key", meta.IdempotencyKey)
 	require.Equal(t, "rev", meta.SourceRevisionID)
 }
+
+func TestDerivedSourceIdentityIsUnambiguousAndScoped(t *testing.T) {
+	id := DerivedSourceKnowledgeID(7, "kb", "public:doc", "main")
+	require.Equal(t, id, DerivedSourceKnowledgeID(7, "kb", "public:doc", "main"))
+	require.NotEqual(t, id, DerivedSourceKnowledgeID(8, "kb", "public:doc", "main"))
+	require.NotEqual(t, id, DerivedSourceKnowledgeID(7, "other-kb", "public:doc", "main"))
+	require.NotEqual(t, DerivedSourceKnowledgeID(7, "kb", "a\nb", "c"), DerivedSourceKnowledgeID(7, "kb", "a", "b\nc"))
+}

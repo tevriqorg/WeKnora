@@ -15,6 +15,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 )
@@ -272,6 +273,9 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	// also persists the pending Wiki op in the same transaction.
 	enteredFinalizing := false
 	wikiSlotOwned := false
+	// Created before the handoff: no post-handoff DB reload can strand slots.
+	batchID := ""
+	if willSpawnTemporal { batchID = uuid.NewString() }
 
 	switch {
 	case knowledge.ParseStatus == types.ParseStatusFinalizing && kb.IndexingStrategy.WikiEnabled:
@@ -333,10 +337,22 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 			if buildErr != nil {
 				return buildErr
 			}
-			promoted, err = seeder.SeedKnowledgeFinalizingWithPendingOp(
-				ctx, payload.KnowledgeID, expectedSubtasks, pendingOp,
-			)
+			if willSpawnTemporal {
+				batchSeeder, ok := s.pendingRepo.(interface {
+					SeedKnowledgeFinalizingWithPendingOpWithBatch(context.Context, string, int, *types.TaskPendingOp, string) (bool, error)
+				})
+				if !ok { return errors.New("temporal Wiki handoff requires batch-aware seeder") }
+				promoted, err = batchSeeder.SeedKnowledgeFinalizingWithPendingOpWithBatch(ctx, payload.KnowledgeID, expectedSubtasks, pendingOp, batchID)
+			} else {
+				promoted, err = seeder.SeedKnowledgeFinalizingWithPendingOp(ctx, payload.KnowledgeID, expectedSubtasks, pendingOp)
+			}
 			wikiSlotOwned = promoted
+		} else if willSpawnTemporal {
+			batchSeeder, ok := s.knowledgeRepo.(interface {
+				SetFinalizingWithBatch(context.Context, string, int, string) (bool, error)
+			})
+			if !ok { return errors.New("temporal handoff requires batch-aware repository") }
+			promoted, err = batchSeeder.SetFinalizingWithBatch(ctx, payload.KnowledgeID, expectedSubtasks, batchID)
 		} else {
 			promoted, err = s.knowledgeRepo.SetFinalizing(ctx, payload.KnowledgeID, expectedSubtasks)
 		}
@@ -381,6 +397,8 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 			return nil
 		}
 	}
+
+	if enteredFinalizing && willSpawnTemporal { knowledge.FinalizingBatchID = batchID }
 
 	// Queue best-effort automatic tagging only after the processing row has
 	// successfully handed off to finalizing or completed. This avoids model calls from a
@@ -444,7 +462,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	// worker serializes its deterministic evidence windows internally.
 	enqueuedTemporal := false
 	if willSpawnTemporal {
-		enqueuedTemporal = s.enqueueTemporalEnrichmentTask(ctx, payload, attempt)
+		enqueuedTemporal = s.enqueueTemporalEnrichmentTask(ctx, payload, attempt, knowledge)
 	}
 
 	// 6. Schedule the Wiki trigger. The durable per-knowledge op already owns
@@ -593,14 +611,24 @@ func temporalEnrichmentEnabled() bool {
 }
 
 func (s *KnowledgePostProcessService) enqueueTemporalEnrichmentTask(
-	ctx context.Context, payload types.KnowledgePostProcessPayload, attempt int,
+	ctx context.Context, payload types.KnowledgePostProcessPayload, attempt int, knowledge *types.Knowledge,
 ) bool {
-	if s.taskEnqueuer == nil {
+	if s.taskEnqueuer == nil || knowledge.FinalizingBatchID == "" {
+		logger.Warnf(ctx, "[KnowledgePostProcess] Temporal batch owner missing for %s", payload.KnowledgeID)
+		return false
+	}
+	derived, err := knowledge.DerivedMetadata()
+	if err != nil || (derived != nil && derived.SnapshotHash == "") {
+		logger.Warnf(ctx, "[KnowledgePostProcess] Invalid derived snapshot for temporal enqueue %s: %v", payload.KnowledgeID, err)
 		return false
 	}
 	taskPayload := types.TemporalEnrichmentPayload{
 		TenantID: payload.TenantID, KnowledgeBaseID: payload.KnowledgeBaseID,
-		KnowledgeID: payload.KnowledgeID, Attempt: attempt,
+		KnowledgeID: payload.KnowledgeID, Attempt: attempt, FinalizesSlot: true,
+		FinalizingBatchID: knowledge.FinalizingBatchID,
+	}
+	if derived != nil {
+		taskPayload.SnapshotHash = derived.SnapshotHash
 	}
 	langfuse.InjectTracing(ctx, &taskPayload)
 	payloadBytes, err := json.Marshal(taskPayload)

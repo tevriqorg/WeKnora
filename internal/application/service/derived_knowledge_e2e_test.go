@@ -23,7 +23,7 @@ func TestG6DerivedEnvelopeReachesTemporalWithOriginalTimecode(t *testing.T) {
 	fixture.svc.kbService = kbSvc
 	require.NoError(t, fixture.db.AutoMigrate(
 		&types.SourceRevision{}, &types.TemporalGraphGeneration{},
-		&types.TemporalEpisodeBinding{}, &types.TemporalTransitionBinding{},
+		&types.TemporalEpisodeBinding{}, &types.TemporalTransitionBinding{}, &types.TemporalFinalizeReceipt{},
 	))
 	fixture.svc.task = client
 	knowledgeRepo := apprepo.NewKnowledgeRepository(fixture.db)
@@ -129,4 +129,46 @@ func TestG6DerivedEnvelopeReachesTemporalWithOriginalTimecode(t *testing.T) {
 	require.Contains(t, temporalRequest.Content, "person enters")
 	require.Contains(t, binding.EvidenceLocatorJSON.ToString(), "1250")
 	require.Contains(t, binding.EvidenceLocatorJSON.ToString(), "event-9")
+}
+
+func TestDerivedRevisionUpdatePersistsHistoryOnStableKnowledge(t *testing.T) {
+	mini := miniredis.RunT(t)
+	client := asynq.NewClient(asynq.RedisClientOpt{Addr: mini.Addr()})
+	defer client.Close()
+	fixture := newDocumentWriteFixture(t)
+	fixture.svc.kbService = &g2OrdinaryDocKBService{kb: fixture.kbs.values["kb"]}
+	require.NoError(t, fixture.db.AutoMigrate(&types.SourceRevision{}))
+	fixture.svc.task = client
+	repo := apprepo.NewKnowledgeRepository(fixture.db)
+	fixture.svc.repo = repo
+	revisions, ok := any(repo).(derivedSourceRevisionStore)
+	require.True(t, ok)
+	svc := newDerivedKnowledgeEnvelopeService(fixture.svc, revisions)
+	first := derivedEnvelope("ready")
+	a, err := svc.Upsert(fixture.ctx, "kb", first)
+	require.NoError(t, err)
+	originalID := a.ID
+	next := derivedEnvelope("ready")
+	next.SourceRevisionID = "rev-2"
+	next.Markdown = "person leaves"
+	b, err := svc.Upsert(fixture.ctx, "kb", next)
+	require.NoError(t, err)
+	require.Equal(t, originalID, b.ID)
+	var history []types.SourceRevision
+	require.NoError(t, fixture.db.Where("knowledge_id = ?", originalID).Order("revision_seq").Find(&history).Error)
+	require.Len(t, history, 2)
+	require.False(t, history[0].IsCurrent)
+	require.True(t, history[1].IsCurrent)
+	require.Equal(t, "rev-2", history[1].NativeVersion)
+	require.Equal(t, next.SourceResourceRef, history[1].ResourceRef)
+	require.Equal(t, next.SourceKey, history[1].Locator)
+	upgrade := *next
+	upgrade.IdempotencyKey = ""
+	upgrade.ProcessorVersion = "consumer-api-v3"
+	c, err := svc.Upsert(fixture.ctx, "kb", &upgrade)
+	require.NoError(t, err)
+	require.Equal(t, originalID, c.ID)
+	var count int64
+	require.NoError(t, fixture.db.Model(&types.SourceRevision{}).Where("knowledge_id = ?", originalID).Count(&count).Error)
+	require.EqualValues(t, 2, count, "processor replay must not create a reality revision")
 }
