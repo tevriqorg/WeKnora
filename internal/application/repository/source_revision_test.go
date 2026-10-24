@@ -74,3 +74,25 @@ func TestSourceRevisionRollbackRestoresPreviousCurrent(t *testing.T) {
 	require.Equal(t, first.RevisionID, rows[0].RevisionID)
 	require.True(t, rows[0].IsCurrent)
 }
+
+
+// #126: rollback of an obsolete staged revision must never delete history
+// or disturb a newer concurrent publication's current identity.
+func TestSourceRevisionRollbackRejectsSupersededRevision(t *testing.T) {
+	repo, db := newSourceRevisionRepoForTest(t)
+	ctx := context.Background()
+	_, _, err := repo.UpsertSourceRevision(ctx, &types.SourceRevision{KnowledgeID: "kn-1", SourceHash: "v1"})
+	require.NoError(t, err)
+	v2, _, err := repo.UpsertSourceRevision(ctx, &types.SourceRevision{KnowledgeID: "kn-1", SourceHash: "v2"})
+	require.NoError(t, err)
+	v3, _, err := repo.UpsertSourceRevision(ctx, &types.SourceRevision{KnowledgeID: "kn-1", SourceHash: "v3"})
+	require.NoError(t, err)
+
+	require.Error(t, repo.RollbackSourceRevision(ctx, "kn-1", v2.RevisionID),
+		"obsolete rollback must fail closed rather than erase historical revision")
+	var rows []types.SourceRevision
+	require.NoError(t, db.Order("revision_seq").Find(&rows).Error)
+	require.Len(t, rows, 3)
+	require.True(t, rows[2].IsCurrent)
+	require.Equal(t, v3.RevisionID, rows[2].RevisionID)
+}
