@@ -57,6 +57,18 @@ func deterministicDerivedTemporalEpisodeUUID(knowledgeID, sourceRevisionID, gene
 	return uuid.NewSHA1(temporalEpisodeNamespace, []byte(name)).String(), nil
 }
 
+// The migration readiness oracle and the worker must use the same episode
+// identity, including derived processor corrections on an unchanged raw
+// SourceRevision. Empty snapshotHash is reserved for native documents.
+func deterministicTemporalEpisodeUUIDForSnapshot(
+	knowledgeID, sourceRevisionID, generationID string, ordinal int, snapshotHash string,
+) (string, error) {
+	if snapshotHash != "" {
+		return deterministicDerivedTemporalEpisodeUUID(knowledgeID, sourceRevisionID, generationID, ordinal, snapshotHash)
+	}
+	return deterministicTemporalEpisodeUUID(knowledgeID, sourceRevisionID, generationID, ordinal)
+}
+
 func temporalReferenceTime(revision *types.SourceRevision) time.Time {
 	if revision == nil {
 		return time.Time{}

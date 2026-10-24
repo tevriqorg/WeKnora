@@ -307,8 +307,20 @@ func (s *AIBOXMigrationService) temporalReady(ctx context.Context, k *types.Know
 	if len(windows) == 0 {
 		return true, nil
 	}
+	derived, err := k.DerivedMetadata()
+	if err != nil {
+		return false, err
+	}
+	snapshotHash := ""
+	if derived != nil {
+		snapshotHash = derived.SnapshotHash
+		if snapshotHash == "" {
+			return false, fmt.Errorf("derived migration snapshot hash missing for %s", k.ID)
+		}
+	}
 	for _, w := range windows {
-		episode, err := deterministicTemporalEpisodeUUID(k.ID, rev.RevisionID, g.GenerationID, w.Ordinal)
+		episode, err := deterministicTemporalEpisodeUUIDForSnapshot(
+			k.ID, rev.RevisionID, g.GenerationID, w.Ordinal, snapshotHash)
 		if err != nil {
 			return false, err
 		}

@@ -102,12 +102,8 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 	}
 	episodeIDs := make([]string, len(windows))
 	for i, window := range windows {
-		var episodeID string
-		if derived != nil {
-			episodeID, err = deterministicDerivedTemporalEpisodeUUID(payload.KnowledgeID, revision.RevisionID, generation.GenerationID, window.Ordinal, derived.SnapshotHash)
-		} else {
-			episodeID, err = deterministicTemporalEpisodeUUID(payload.KnowledgeID, revision.RevisionID, generation.GenerationID, window.Ordinal)
-		}
+		episodeID, err := deterministicTemporalEpisodeUUIDForSnapshot(
+			payload.KnowledgeID, revision.RevisionID, generation.GenerationID, window.Ordinal, payload.SnapshotHash)
 		if err != nil {
 			return err
 		}

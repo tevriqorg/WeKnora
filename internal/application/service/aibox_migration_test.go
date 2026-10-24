@@ -191,4 +191,27 @@ func TestG7DerivedSnapshotReadyUsesWorkerEpisodeIdentity(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, pre.Blocked, "derived snapshot already has ready worker bindings")
 	require.Equal(t, 1, pre.BackfillReady)
+	again, err := svc.Prepare(ctx, migrationConfig())
+	require.NoError(t, err)
+	require.Zero(t, again.BackfillEnqueued, "ready derived binding must not be requeued")
+	require.Equal(t, 1, again.BackfillReady)
+
+	// A native UUID must not falsely certify a derived snapshot as ready.
+	require.NoError(t, db.Where("knowledge_id = ?", "kn-1").Delete(&types.TemporalEpisodeBinding{}).Error)
+	for _, w := range windows {
+		ep, err := deterministicTemporalEpisodeUUID("kn-1", rev.RevisionID, gen.GenerationID, w.Ordinal)
+		require.NoError(t, err)
+		ord := w.Ordinal
+		require.NoError(t, db.Create(&types.TemporalEpisodeBinding{
+			EpisodeUUID: ep, GenerationID: gen.GenerationID, GroupID: gen.GroupID,
+			KnowledgeID: "kn-1", SourceRevisionID: rev.RevisionID, WindowOrdinal: &ord,
+			ReferenceTime: time.Now(), SourceKind: "text", AuthorityKey: "knowledge:kn-1",
+			EvidenceSnapshot: w.Content, SnapshotHash: w.SnapshotHash,
+			ExtractionSchemaVersion: gen.ExtractionSchemaVersion,
+			ModelConfigFingerprint: gen.ModelConfigFingerprint, TemporalStatus: types.TemporalStatusReady,
+		}).Error)
+	}
+	pre, err = svc.Preflight(ctx, migrationConfig())
+	require.NoError(t, err)
+	require.Contains(t, pre.Blocked, "knowledge:kn-1:temporal-backfill-incomplete")
 }
