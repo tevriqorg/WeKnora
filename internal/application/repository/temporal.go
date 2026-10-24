@@ -157,10 +157,10 @@ func (r *TemporalRepository) CommitEpisodeForDerivedSnapshot(
 // snapshot publication on PostgreSQL. Legacy derived tasks without a snapshot
 // token fail closed instead of draining a newer run's counter.
 func (r *TemporalRepository) FinalizeSubtaskForSnapshot(
-	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash string,
+	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash, batchID string,
 ) error {
-	if tenantID == 0 || knowledgeID == "" {
-		return errors.New("temporal finalize requires tenant and knowledge")
+	if tenantID == 0 || knowledgeID == "" || batchID == "" {
+		return ErrTemporalSnapshotSuperseded
 	}
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var knowledge types.Knowledge
@@ -169,7 +169,7 @@ func (r *TemporalRepository) FinalizeSubtaskForSnapshot(
 			First(&knowledge).Error; err != nil {
 			return err
 		}
-		if knowledge.ParseStatus != types.ParseStatusFinalizing {
+		if knowledge.ParseStatus != types.ParseStatusFinalizing || knowledge.FinalizingBatchID != batchID {
 			return ErrTemporalSnapshotSuperseded
 		}
 		derived, err := knowledge.DerivedMetadata()
@@ -183,6 +183,10 @@ func (r *TemporalRepository) FinalizeSubtaskForSnapshot(
 		} else if snapshotHash != "" {
 			return ErrTemporalSnapshotSuperseded
 		}
+		receipt := &types.TemporalFinalizeReceipt{BatchID: batchID, SlotKind: "temporal", TenantID: tenantID, KnowledgeID: knowledgeID}
+		insert := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(receipt)
+		if insert.Error != nil { return insert.Error }
+		if insert.RowsAffected == 0 { return nil }
 		_, err = finalizeSubtask(tx, knowledgeID)
 		return err
 	})

@@ -9,6 +9,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -171,6 +172,7 @@ func (r *taskPendingOpsRepository) SeedKnowledgeFinalizingWithPendingOp(
 			Updates(map[string]interface{}{
 				"parse_status":           types.ParseStatusFinalizing,
 				"pending_subtasks_count": expectedSubtasks,
+				"finalizing_batch_id": uuid.NewString(),
 				"updated_at":             time.Now(),
 			})
 		if res.Error != nil {

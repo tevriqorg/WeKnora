@@ -396,6 +396,7 @@ type TemporalEnrichmentPayload struct {
 	KnowledgeID     string `json:"knowledge_id"`
 	Attempt         int    `json:"attempt,omitempty"`
 	SnapshotHash    string `json:"snapshot_hash,omitempty"`
+	FinalizingBatchID string `json:"finalizing_batch_id,omitempty"`
 	FinalizesSlot   bool   `json:"finalizes_slot,omitempty"`
 }
 

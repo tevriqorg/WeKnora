@@ -382,6 +382,13 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		}
 	}
 
+	// Load the durable handoff owner after normal or Wiki-atomic seeding.
+	if enteredFinalizing && willSpawnTemporal {
+		fresh, err := s.knowledgeRepo.GetKnowledgeByID(ctx, payload.TenantID, payload.KnowledgeID)
+		if err != nil { return fmt.Errorf("reload temporal batch owner: %w", err) }
+		knowledge.FinalizingBatchID = fresh.FinalizingBatchID
+	}
+
 	// Queue best-effort automatic tagging only after the processing row has
 	// successfully handed off to finalizing or completed. This avoids model calls from a
 	// duplicate post-process delivery that observes an already terminal row.
@@ -595,7 +602,8 @@ func temporalEnrichmentEnabled() bool {
 func (s *KnowledgePostProcessService) enqueueTemporalEnrichmentTask(
 	ctx context.Context, payload types.KnowledgePostProcessPayload, attempt int, knowledge *types.Knowledge,
 ) bool {
-	if s.taskEnqueuer == nil {
+	if s.taskEnqueuer == nil || knowledge.FinalizingBatchID == "" {
+		logger.Warnf(ctx, "[KnowledgePostProcess] Temporal batch owner missing for %s", payload.KnowledgeID)
 		return false
 	}
 	derived, err := knowledge.DerivedMetadata()
@@ -606,6 +614,7 @@ func (s *KnowledgePostProcessService) enqueueTemporalEnrichmentTask(
 	taskPayload := types.TemporalEnrichmentPayload{
 		TenantID: payload.TenantID, KnowledgeBaseID: payload.KnowledgeBaseID,
 		KnowledgeID: payload.KnowledgeID, Attempt: attempt, FinalizesSlot: true,
+		FinalizingBatchID: knowledge.FinalizingBatchID,
 	}
 	if derived != nil {
 		taskPayload.SnapshotHash = derived.SnapshotHash

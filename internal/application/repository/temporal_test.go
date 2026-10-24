@@ -19,7 +19,7 @@ func newTemporalRepoForTest(t *testing.T) (*TemporalRepository, *gorm.DB) {
 		&types.Knowledge{},
 		&types.TemporalGraphGeneration{},
 		&types.TemporalEpisodeBinding{},
-		&types.TemporalTransitionBinding{},
+		&types.TemporalTransitionBinding{}, &types.TemporalFinalizeReceipt{},
 	))
 	return NewTemporalRepository(db), db
 }

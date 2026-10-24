@@ -23,7 +23,7 @@ func newTemporalEnrichmentTestService(t *testing.T, adapterURL string) (*Tempora
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
 		&types.Knowledge{}, &types.Chunk{}, &types.SourceRevision{},
-		&types.TemporalGraphGeneration{}, &types.TemporalEpisodeBinding{}, &types.TemporalTransitionBinding{},
+		&types.TemporalGraphGeneration{}, &types.TemporalEpisodeBinding{}, &types.TemporalTransitionBinding{}, &types.TemporalFinalizeReceipt{},
 	))
 	knowledgeRepo := apprepo.NewKnowledgeRepository(db)
 	chunkRepo := apprepo.NewChunkRepository(db)
@@ -41,7 +41,7 @@ func seedTemporalEnrichmentTest(t *testing.T, db *gorm.DB) {
 	now := time.Date(2026, 10, 15, 2, 3, 4, 0, time.UTC)
 	require.NoError(t, db.Create(&types.Knowledge{
 		ID: "kn-1", TenantID: 7, KnowledgeBaseID: "kb-1",
-		ParseStatus: types.ParseStatusFinalizing, PendingSubtasksCount: 1,
+		ParseStatus: types.ParseStatusFinalizing, PendingSubtasksCount: 1, FinalizingBatchID: "batch-native-1",
 	}).Error)
 	require.NoError(t, db.Create(&types.SourceRevision{
 		RevisionID: "rev-1", KnowledgeID: "kn-1", RevisionSeq: 1,
@@ -66,7 +66,7 @@ func temporalTaskForSnapshot(t *testing.T, snapshotHash string) *asynq.Task {
 	t.Helper()
 	payload, err := json.Marshal(types.TemporalEnrichmentPayload{
 		TenantID: 7, KnowledgeBaseID: "kb-1", KnowledgeID: "kn-1",
-		SnapshotHash: snapshotHash, FinalizesSlot: true,
+		SnapshotHash: snapshotHash, FinalizingBatchID: "batch-native-1", FinalizesSlot: true,
 	})
 	require.NoError(t, err)
 	return asynq.NewTask(types.TypeTemporalEnrichment, payload)

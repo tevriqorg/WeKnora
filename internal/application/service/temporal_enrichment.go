@@ -272,7 +272,7 @@ func releaseTemporalSnapshotSubtaskSlot(
 	defer cancel()
 	var lastErr error
 	for attempt := 1; attempt <= subtaskSlotReleaseAttempts; attempt++ {
-		err := repo.FinalizeSubtaskForSnapshot(dctx, payload.TenantID, payload.KnowledgeID, payload.SnapshotHash)
+		err := repo.FinalizeSubtaskForSnapshot(dctx, payload.TenantID, payload.KnowledgeID, payload.SnapshotHash, payload.FinalizingBatchID)
 		if err == nil || errors.Is(err, apprepo.ErrTemporalSnapshotSuperseded) {
 			return nil
 		}

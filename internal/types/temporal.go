@@ -72,3 +72,14 @@ type TemporalTransitionBinding struct {
 }
 
 func (TemporalTransitionBinding) TableName() string { return "temporal_transition_bindings" }
+
+// One temporal slot is owned by each distinct finalizing batch.
+type TemporalFinalizeReceipt struct {
+	BatchID string `json:"batch_id" gorm:"type:varchar(36);primaryKey"`
+	SlotKind string `json:"slot_kind" gorm:"type:varchar(32);primaryKey"`
+	TenantID uint64 `json:"tenant_id" gorm:"not null"`
+	KnowledgeID string `json:"knowledge_id" gorm:"type:varchar(36);not null"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (TemporalFinalizeReceipt) TableName() string { return "temporal_finalize_receipts" }
