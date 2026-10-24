@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -103,9 +104,15 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 		episodeIDs[i] = episodeID
 	}
 	if derived != nil {
-		// Old facts must not remain current while the replacement is pending.
-		// A new Graphiti UUID forces extraction instead of cached replay.
-		if err := s.temporalRepo.MarkSupersededEpisodeBindings(ctx, generation.GenerationID, payload.KnowledgeID, revision.RevisionID, episodeIDs); err != nil {
+		// Invalidation is also fenced: an old worker cannot stale a newer
+		// snapshot's bindings after publication.
+		if err := s.temporalRepo.MarkSupersededEpisodeBindingsForDerivedSnapshot(
+			ctx, payload.TenantID, payload.KnowledgeID, derived.SnapshotHash,
+			generation.GenerationID, revision.RevisionID, episodeIDs,
+		); err != nil {
+			if errors.Is(err, apprepo.ErrTemporalSnapshotSuperseded) {
+				return nil
+			}
 			return fmt.Errorf("invalidate stale derived temporal bindings: %w", err)
 		}
 	}
@@ -120,6 +127,13 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 	retryCount, _ := asynq.GetRetryCount(ctx)
 	temporalAttempt := retryCount + 1
 	finalAttempt := isFinalAsynqAttempt(ctx)
+	persistBinding := func(writeCtx context.Context, binding *types.TemporalEpisodeBinding) error {
+		if derived != nil {
+			return s.temporalRepo.UpsertEpisodeBindingForDerivedSnapshot(
+				writeCtx, payload.TenantID, payload.KnowledgeID, derived.SnapshotHash, binding)
+		}
+		return s.temporalRepo.UpsertEpisodeBinding(writeCtx, binding)
+	}
 	previousEpisodeUUIDs := make([]string, 0, len(windows))
 	referenceTime := temporalReferenceTime(revision)
 	authorityKey := "knowledge:" + payload.KnowledgeID
@@ -158,7 +172,10 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 		binding.TemporalStatus = types.TemporalStatusRunning
 		binding.TemporalAttempt = temporalAttempt
 		binding.LastError = ""
-		if err := s.temporalRepo.UpsertEpisodeBinding(ctx, binding); err != nil {
+		if err := persistBinding(ctx, binding); err != nil {
+			if errors.Is(err, apprepo.ErrTemporalSnapshotSuperseded) {
+				return nil
+			}
 			return fmt.Errorf("persist running temporal binding: %w", err)
 		}
 
@@ -186,7 +203,9 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 			} else {
 				binding.TemporalStatus = types.TemporalStatusRunning
 			}
-			_ = s.temporalRepo.UpsertEpisodeBinding(context.WithoutCancel(ctx), binding)
+			if persistErr := persistBinding(context.WithoutCancel(ctx), binding); errors.Is(persistErr, apprepo.ErrTemporalSnapshotSuperseded) {
+				return nil
+			}
 			return fmt.Errorf("upsert temporal episode %s: %w", episodeUUID, err)
 		}
 
@@ -208,15 +227,26 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 		// ready. If this write fails, the binding remains running; a retry uses
 		// the deterministic Episode UUID and Graphiti's Episode receipt to rebuild
 		// these rows without re-running extraction.
-		if err := s.temporalRepo.InsertTransitions(ctx, transitions); err != nil {
-			return fmt.Errorf("persist temporal transitions: %w", err)
-		}
 		binding.TemporalStatus = types.TemporalStatusReady
 		binding.TemporalAttempt = temporalAttempt
 		binding.CompletedAt = &now
 		binding.LastError = ""
-		if err := s.temporalRepo.UpsertEpisodeBinding(ctx, binding); err != nil {
-			return fmt.Errorf("persist ready temporal binding: %w", err)
+		if derived != nil {
+			// Keep transitions and ready acknowledgement in one snapshot-
+			// fenced transaction. The adapter call itself is not a DB lock.
+			err = s.temporalRepo.CommitEpisodeForDerivedSnapshot(
+				ctx, payload.TenantID, payload.KnowledgeID, derived.SnapshotHash, binding, transitions)
+		} else {
+			err = s.temporalRepo.InsertTransitions(ctx, transitions)
+			if err == nil {
+				err = persistBinding(ctx, binding)
+			}
+		}
+		if err != nil {
+			if errors.Is(err, apprepo.ErrTemporalSnapshotSuperseded) {
+				return nil
+			}
+			return fmt.Errorf("persist temporal transition/ready binding: %w", err)
 		}
 		previousEpisodeUUIDs = append(previousEpisodeUUIDs, episodeUUID)
 	}

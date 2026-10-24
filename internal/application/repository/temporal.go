@@ -84,6 +84,73 @@ func (r *TemporalRepository) UpsertEpisodeBinding(ctx context.Context, binding *
 	}).Create(binding).Error
 }
 
+// ErrTemporalSnapshotSuperseded indicates that a queued/in-flight extraction
+// no longer owns the Knowledge snapshot. It must not retry writes as current.
+var ErrTemporalSnapshotSuperseded = errors.New("temporal derived snapshot superseded")
+
+// withCurrentDerivedSnapshot serializes each projection write with updates to
+// the Knowledge row. PostgreSQL FOR UPDATE makes the snapshot check and the
+// binding/transition write atomic relative to a new derived publication.
+// The old snapshot can legitimately be published again (rollback), so status
+// alone is not a sufficient fence.
+func (r *TemporalRepository) withCurrentDerivedSnapshot(
+	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash string,
+	write func(*TemporalRepository) error,
+) error {
+	if tenantID == 0 || knowledgeID == "" || snapshotHash == "" {
+		return errors.New("derived temporal write requires tenant, knowledge and snapshot")
+	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var knowledge types.Knowledge
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND tenant_id = ?", knowledgeID, tenantID).
+			First(&knowledge).Error; err != nil {
+			return err
+		}
+		derived, err := knowledge.DerivedMetadata()
+		if err != nil {
+			return err
+		}
+		if derived == nil || derived.SnapshotHash != snapshotHash {
+			return ErrTemporalSnapshotSuperseded
+		}
+		return write(&TemporalRepository{db: tx})
+	})
+}
+
+func (r *TemporalRepository) MarkSupersededEpisodeBindingsForDerivedSnapshot(
+	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash,
+	generationID, revisionID string, keepEpisodeUUIDs []string,
+) error {
+	return r.withCurrentDerivedSnapshot(ctx, tenantID, knowledgeID, snapshotHash, func(txRepo *TemporalRepository) error {
+		return txRepo.MarkSupersededEpisodeBindings(ctx, generationID, knowledgeID, revisionID, keepEpisodeUUIDs)
+	})
+}
+
+func (r *TemporalRepository) UpsertEpisodeBindingForDerivedSnapshot(
+	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash string,
+	binding *types.TemporalEpisodeBinding,
+) error {
+	return r.withCurrentDerivedSnapshot(ctx, tenantID, knowledgeID, snapshotHash, func(txRepo *TemporalRepository) error {
+		return txRepo.UpsertEpisodeBinding(ctx, binding)
+	})
+}
+
+// Commit the adapter receipt and its ready binding together, under the same
+// snapshot fence. A late old worker cannot insert stale transitions and then
+// resurrect its old binding after a newer publication.
+func (r *TemporalRepository) CommitEpisodeForDerivedSnapshot(
+	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash string,
+	binding *types.TemporalEpisodeBinding, transitions []types.TemporalTransitionBinding,
+) error {
+	return r.withCurrentDerivedSnapshot(ctx, tenantID, knowledgeID, snapshotHash, func(txRepo *TemporalRepository) error {
+		if err := txRepo.InsertTransitions(ctx, transitions); err != nil {
+			return err
+		}
+		return txRepo.UpsertEpisodeBinding(ctx, binding)
+	})
+}
+
 // MarkSupersededEpisodeBindings removes old derived projections from the
 // current evidence view before a corrected snapshot is extracted. The raw
 // SourceRevision stays authoritative and is never rewritten by this method.
