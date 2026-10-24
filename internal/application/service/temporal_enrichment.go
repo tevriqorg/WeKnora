@@ -50,8 +50,13 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 		return nil
 	}
 	defer func() {
-		finalizeSubtaskDetached(ctx, s.knowledgeRepo, payload.KnowledgeID, "temporal",
-			retErr, false, isFinalAsynqAttempt(ctx))
+		if !payload.FinalizesSlot || (retErr != nil && !isFinalAsynqAttempt(ctx)) ||
+			attemptSuperseded(ctx, s.tracker, payload.KnowledgeID, payload.Attempt) {
+			return
+		}
+		if err := releaseTemporalSnapshotSubtaskSlot(ctx, s.temporalRepo, payload); err != nil {
+			logger.Errorf(ctx, "temporal finalize slot failed knowledge=%s: %v", payload.KnowledgeID, err)
+		}
 	}()
 
 	generation, err := s.temporalRepo.GetActiveGeneration(ctx, payload.TenantID, payload.KnowledgeBaseID)
@@ -80,6 +85,11 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 	}
 	if derived != nil && derived.SnapshotHash == "" {
 		return fmt.Errorf("derived temporal snapshot hash missing")
+	}
+	if (derived != nil && payload.SnapshotHash != derived.SnapshotHash) ||
+		(derived == nil && payload.SnapshotHash != "") {
+		logger.Infof(ctx, "temporal: snapshot token no longer owns knowledge=%s, skipping", payload.KnowledgeID)
+		return nil
 	}
 	chunks, err := s.chunkRepo.ListChunksByKnowledgeIDAndTypes(ctx, payload.TenantID, payload.KnowledgeID,
 		[]types.ChunkType{types.ChunkTypeText, types.ChunkTypeImageOCR, types.ChunkTypeImageCaption})
@@ -251,4 +261,34 @@ func (s *TemporalEnrichmentService) Handle(ctx context.Context, task *asynq.Task
 		previousEpisodeUUIDs = append(previousEpisodeUUIDs, episodeUUID)
 	}
 	return nil
+}
+
+
+// releaseTemporalSnapshotSubtaskSlot retries a bounded detached release.
+// Superseded snapshots are terminal no-ops, never successful decrements.
+func releaseTemporalSnapshotSubtaskSlot(
+	ctx context.Context, repo *apprepo.TemporalRepository, payload types.TemporalEnrichmentPayload,
+) error {
+	if repo == nil {
+		return errors.New("temporal repository missing for finalize")
+	}
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeSubtaskDetachedTimeout)
+	defer cancel()
+	var lastErr error
+	for attempt := 1; attempt <= subtaskSlotReleaseAttempts; attempt++ {
+		err := repo.FinalizeSubtaskForSnapshot(dctx, payload.TenantID, payload.KnowledgeID, payload.SnapshotHash)
+		if err == nil || errors.Is(err, apprepo.ErrTemporalSnapshotSuperseded) {
+			return nil
+		}
+		lastErr = err
+		if attempt == subtaskSlotReleaseAttempts {
+			break
+		}
+		select {
+		case <-time.After(time.Duration(attempt) * subtaskSlotReleaseBackoff):
+		case <-dctx.Done():
+			return fmt.Errorf("%w (last error: %v)", dctx.Err(), lastErr)
+		}
+	}
+	return lastErr
 }

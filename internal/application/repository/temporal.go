@@ -151,6 +151,43 @@ func (r *TemporalRepository) CommitEpisodeForDerivedSnapshot(
 	})
 }
 
+// FinalizeSubtaskForSnapshot releases a temporal parse slot only while the
+// task's exact derived snapshot (or native non-derived identity) still owns
+// the Knowledge row. The row lock makes this check and decrement atomic with
+// snapshot publication on PostgreSQL. Legacy derived tasks without a snapshot
+// token fail closed instead of draining a newer run's counter.
+func (r *TemporalRepository) FinalizeSubtaskForSnapshot(
+	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash string,
+) error {
+	if tenantID == 0 || knowledgeID == "" {
+		return errors.New("temporal finalize requires tenant and knowledge")
+	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var knowledge types.Knowledge
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND tenant_id = ?", knowledgeID, tenantID).
+			First(&knowledge).Error; err != nil {
+			return err
+		}
+		if knowledge.ParseStatus != types.ParseStatusFinalizing {
+			return ErrTemporalSnapshotSuperseded
+		}
+		derived, err := knowledge.DerivedMetadata()
+		if err != nil {
+			return err
+		}
+		if derived != nil {
+			if snapshotHash == "" || derived.SnapshotHash != snapshotHash {
+				return ErrTemporalSnapshotSuperseded
+			}
+		} else if snapshotHash != "" {
+			return ErrTemporalSnapshotSuperseded
+		}
+		_, err = finalizeSubtask(tx, knowledgeID)
+		return err
+	})
+}
+
 // MarkSupersededEpisodeBindings removes old derived projections from the
 // current evidence view before a corrected snapshot is extracted. The raw
 // SourceRevision stays authoritative and is never rewritten by this method.

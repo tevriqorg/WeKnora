@@ -444,7 +444,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	// worker serializes its deterministic evidence windows internally.
 	enqueuedTemporal := false
 	if willSpawnTemporal {
-		enqueuedTemporal = s.enqueueTemporalEnrichmentTask(ctx, payload, attempt)
+		enqueuedTemporal = s.enqueueTemporalEnrichmentTask(ctx, payload, attempt, knowledge)
 	}
 
 	// 6. Schedule the Wiki trigger. The durable per-knowledge op already owns
@@ -593,14 +593,22 @@ func temporalEnrichmentEnabled() bool {
 }
 
 func (s *KnowledgePostProcessService) enqueueTemporalEnrichmentTask(
-	ctx context.Context, payload types.KnowledgePostProcessPayload, attempt int,
+	ctx context.Context, payload types.KnowledgePostProcessPayload, attempt int, knowledge *types.Knowledge,
 ) bool {
 	if s.taskEnqueuer == nil {
 		return false
 	}
+	derived, err := knowledge.DerivedMetadata()
+	if err != nil || (derived != nil && derived.SnapshotHash == "") {
+		logger.Warnf(ctx, "[KnowledgePostProcess] Invalid derived snapshot for temporal enqueue %s: %v", payload.KnowledgeID, err)
+		return false
+	}
 	taskPayload := types.TemporalEnrichmentPayload{
 		TenantID: payload.TenantID, KnowledgeBaseID: payload.KnowledgeBaseID,
-		KnowledgeID: payload.KnowledgeID, Attempt: attempt,
+		KnowledgeID: payload.KnowledgeID, Attempt: attempt, FinalizesSlot: true,
+	}
+	if derived != nil {
+		taskPayload.SnapshotHash = derived.SnapshotHash
 	}
 	langfuse.InjectTracing(ctx, &taskPayload)
 	payloadBytes, err := json.Marshal(taskPayload)

@@ -360,7 +360,19 @@ func (s *AIBOXMigrationService) enqueueTemporalBackfill(ctx context.Context, rep
 				report.BackfillReady++
 				continue
 			}
-			payload, _ := json.Marshal(types.TemporalEnrichmentPayload{TenantID: k.TenantID, KnowledgeBaseID: k.KnowledgeBaseID, KnowledgeID: k.ID})
+			derived, err := k.DerivedMetadata()
+			if err != nil {
+				return err
+			}
+			snapshotHash := ""
+			if derived != nil {
+				snapshotHash = derived.SnapshotHash
+				if snapshotHash == "" {
+					return fmt.Errorf("derived migration snapshot missing for %s", k.ID)
+				}
+			}
+			// Backfill is not an owner of the live parse finalizing counter.
+			payload, _ := json.Marshal(types.TemporalEnrichmentPayload{TenantID: k.TenantID, KnowledgeBaseID: k.KnowledgeBaseID, KnowledgeID: k.ID, SnapshotHash: snapshotHash})
 			task := asynq.NewTask(types.TypeTemporalEnrichment, payload, asynq.Queue(types.QueueTemporal), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
 			_, err = s.task.Enqueue(task, asynq.Unique(30*time.Minute))
 			if errors.Is(err, asynq.ErrDuplicateTask) {

@@ -395,6 +395,8 @@ type TemporalEnrichmentPayload struct {
 	KnowledgeBaseID string `json:"knowledge_base_id"`
 	KnowledgeID     string `json:"knowledge_id"`
 	Attempt         int    `json:"attempt,omitempty"`
+	SnapshotHash    string `json:"snapshot_hash,omitempty"`
+	FinalizesSlot   bool   `json:"finalizes_slot,omitempty"`
 }
 
 type SummaryGenerationPayload struct {

@@ -50,7 +50,7 @@ func TestDerivedTemporalInFlightOldWorkerCannotResurrectStaleBinding(t *testing.
 	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "kn-1").Update("metadata", knowledge.Metadata).Error)
 
 	firstDone := make(chan error, 1)
-	firstTask := temporalTask(t)
+	firstTask := temporalTaskForSnapshot(t, "derived-v1")
 	go func() { firstDone <- service.Handle(context.Background(), firstTask) }()
 	select {
 	case <-firstEntered:
@@ -67,7 +67,7 @@ func TestDerivedTemporalInFlightOldWorkerCannotResurrectStaleBinding(t *testing.
 	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "kn-1").Updates(map[string]any{
 		"metadata": knowledge.Metadata, "parse_status": types.ParseStatusFinalizing, "pending_subtasks_count": 1,
 	}).Error)
-	require.NoError(t, service.Handle(context.Background(), temporalTask(t)))
+	require.NoError(t, service.Handle(context.Background(), temporalTaskForSnapshot(t, "derived-v2")))
 	require.EqualValues(t, 2, calls.Load())
 
 	close(releaseFirst)
@@ -131,7 +131,7 @@ func TestDerivedTemporalSupersededWorkerCannotReleaseNewFinalizeSlot(t *testing.
     require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "kn-1").Update("metadata", knowledge.Metadata).Error)
 
     firstDone := make(chan error, 1)
-    go func() { firstDone <- service.Handle(context.Background(), temporalTask(t)) }()
+    go func() { firstDone <- service.Handle(context.Background(), temporalTaskForSnapshot(t, "derived-v1")) }()
     select {
     case <-firstEntered:
     case <-time.After(10 * time.Second):
@@ -148,7 +148,7 @@ func TestDerivedTemporalSupersededWorkerCannotReleaseNewFinalizeSlot(t *testing.
         "metadata": knowledge.Metadata, "parse_status": types.ParseStatusFinalizing,
         "pending_subtasks_count": 2,
     }).Error)
-    require.NoError(t, service.Handle(context.Background(), temporalTask(t)))
+    require.NoError(t, service.Handle(context.Background(), temporalTaskForSnapshot(t, "derived-v2")))
     require.EqualValues(t, 2, calls.Load())
     require.NoError(t, db.First(&knowledge, "id = ?", "kn-1").Error)
     require.Equal(t, types.ParseStatusFinalizing, knowledge.ParseStatus)

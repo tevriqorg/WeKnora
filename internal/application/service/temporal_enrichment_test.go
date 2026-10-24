@@ -59,9 +59,14 @@ func seedTemporalEnrichmentTest(t *testing.T, db *gorm.DB) {
 }
 
 func temporalTask(t *testing.T) *asynq.Task {
+	return temporalTaskForSnapshot(t, "")
+}
+
+func temporalTaskForSnapshot(t *testing.T, snapshotHash string) *asynq.Task {
 	t.Helper()
 	payload, err := json.Marshal(types.TemporalEnrichmentPayload{
 		TenantID: 7, KnowledgeBaseID: "kb-1", KnowledgeID: "kn-1",
+		SnapshotHash: snapshotHash, FinalizesSlot: true,
 	})
 	require.NoError(t, err)
 	return asynq.NewTask(types.TypeTemporalEnrichment, payload)
@@ -166,7 +171,7 @@ func TestDerivedTemporalSnapshotRefreshesUnchangedNativeRevision(t *testing.T) {
     require.NoError(t, knowledge.SetDerivedMetadata(&types.DerivedKnowledgeMetadata{SnapshotHash: "derived-v1", SourceRevisionID: "native-unchanged"}))
     require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "kn-1").Update("metadata", knowledge.Metadata).Error)
 
-    require.NoError(t, service.Handle(context.Background(), temporalTask(t)))
+    require.NoError(t, service.Handle(context.Background(), temporalTaskForSnapshot(t, "derived-v1")))
     require.EqualValues(t, 1, calls.Load())
     var sourceCount int64
     require.NoError(t, db.Model(&types.SourceRevision{}).Where("knowledge_id = ?", "kn-1").Count(&sourceCount).Error)
@@ -177,7 +182,7 @@ func TestDerivedTemporalSnapshotRefreshesUnchangedNativeRevision(t *testing.T) {
     require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "kn-1").Updates(map[string]any{
         "metadata": knowledge.Metadata, "parse_status": types.ParseStatusFinalizing, "pending_subtasks_count": 1,
     }).Error)
-    require.NoError(t, service.Handle(context.Background(), temporalTask(t)))
+    require.NoError(t, service.Handle(context.Background(), temporalTaskForSnapshot(t, "derived-v2")))
     require.EqualValues(t, 2, calls.Load(), "new derived snapshot must reach adapter despite unchanged native revision")
     require.Len(t, episodeIDs, 2)
     require.NotEqual(t, episodeIDs[0], episodeIDs[1], "Graphiti deduplicates identical episode UUIDs")
@@ -190,4 +195,61 @@ func TestDerivedTemporalSnapshotRefreshesUnchangedNativeRevision(t *testing.T) {
     require.Equal(t, types.TemporalStatusReady, statuses[episodeIDs[1]])
     require.NoError(t, db.Model(&types.SourceRevision{}).Where("knowledge_id = ?", "kn-1").Count(&sourceCount).Error)
     require.EqualValues(t, 1, sourceCount, "processor-only correction must not create a raw revision")
+}
+
+// Old queue payloads do not identify a derived snapshot. They must never
+// process the newest revision or consume its finalizing counter.
+func TestDerivedTemporalLegacyTaskWithoutSnapshotFailsClosed(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	service, db := newTemporalEnrichmentTestService(t, server.URL)
+	seedTemporalEnrichmentTest(t, db)
+	var knowledge types.Knowledge
+	require.NoError(t, db.First(&knowledge, "id = ?", "kn-1").Error)
+	require.NoError(t, knowledge.SetDerivedMetadata(&types.DerivedKnowledgeMetadata{
+		SnapshotHash: "derived-v2", SourceRevisionID: "native-unchanged",
+	}))
+	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "kn-1").
+		Update("metadata", knowledge.Metadata).Error)
+	require.NoError(t, service.Handle(context.Background(), temporalTask(t)))
+	require.Zero(t, calls.Load(), "legacy payload must not index an unowned snapshot")
+	require.NoError(t, db.First(&knowledge, "id = ?", "kn-1").Error)
+	require.Equal(t, types.ParseStatusFinalizing, knowledge.ParseStatus)
+	require.Equal(t, 1, knowledge.PendingSubtasksCount)
+}
+
+// A migration/backfill task can enrich a snapshot, but it does not own a
+// pending_subtasks_count slot from the live parse attempt.
+func TestDerivedTemporalBackfillDoesNotReleaseLiveParseSlot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req TemporalEpisodeRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(TemporalEpisodeResult{
+			EpisodeUUID: req.EpisodeUUID, Status: "committed",
+		}))
+	}))
+	defer server.Close()
+	service, db := newTemporalEnrichmentTestService(t, server.URL)
+	seedTemporalEnrichmentTest(t, db)
+	var knowledge types.Knowledge
+	require.NoError(t, db.First(&knowledge, "id = ?", "kn-1").Error)
+	require.NoError(t, knowledge.SetDerivedMetadata(&types.DerivedKnowledgeMetadata{
+		SnapshotHash: "derived-v1", SourceRevisionID: "native-unchanged",
+	}))
+	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "kn-1").
+		Update("metadata", knowledge.Metadata).Error)
+	payload, err := json.Marshal(types.TemporalEnrichmentPayload{
+		TenantID: 7, KnowledgeBaseID: "kb-1", KnowledgeID: "kn-1",
+		SnapshotHash: "derived-v1", FinalizesSlot: false,
+	})
+	require.NoError(t, err)
+	require.NoError(t, service.Handle(context.Background(), asynq.NewTask(types.TypeTemporalEnrichment, payload)))
+	require.NoError(t, db.First(&knowledge, "id = ?", "kn-1").Error)
+	require.Equal(t, types.ParseStatusFinalizing, knowledge.ParseStatus)
+	require.Equal(t, 1, knowledge.PendingSubtasksCount)
 }
