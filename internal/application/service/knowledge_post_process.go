@@ -15,6 +15,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 )
@@ -272,6 +273,9 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	// also persists the pending Wiki op in the same transaction.
 	enteredFinalizing := false
 	wikiSlotOwned := false
+	// Created before the handoff: no post-handoff DB reload can strand slots.
+	batchID := ""
+	if willSpawnTemporal { batchID = uuid.NewString() }
 
 	switch {
 	case knowledge.ParseStatus == types.ParseStatusFinalizing && kb.IndexingStrategy.WikiEnabled:
@@ -333,10 +337,22 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 			if buildErr != nil {
 				return buildErr
 			}
-			promoted, err = seeder.SeedKnowledgeFinalizingWithPendingOp(
-				ctx, payload.KnowledgeID, expectedSubtasks, pendingOp,
-			)
+			if willSpawnTemporal {
+				batchSeeder, ok := s.pendingRepo.(interface {
+					SeedKnowledgeFinalizingWithPendingOpWithBatch(context.Context, string, int, *types.TaskPendingOp, string) (bool, error)
+				})
+				if !ok { return errors.New("temporal Wiki handoff requires batch-aware seeder") }
+				promoted, err = batchSeeder.SeedKnowledgeFinalizingWithPendingOpWithBatch(ctx, payload.KnowledgeID, expectedSubtasks, pendingOp, batchID)
+			} else {
+				promoted, err = seeder.SeedKnowledgeFinalizingWithPendingOp(ctx, payload.KnowledgeID, expectedSubtasks, pendingOp)
+			}
 			wikiSlotOwned = promoted
+		} else if willSpawnTemporal {
+			batchSeeder, ok := s.knowledgeRepo.(interface {
+				SetFinalizingWithBatch(context.Context, string, int, string) (bool, error)
+			})
+			if !ok { return errors.New("temporal handoff requires batch-aware repository") }
+			promoted, err = batchSeeder.SetFinalizingWithBatch(ctx, payload.KnowledgeID, expectedSubtasks, batchID)
 		} else {
 			promoted, err = s.knowledgeRepo.SetFinalizing(ctx, payload.KnowledgeID, expectedSubtasks)
 		}
@@ -382,12 +398,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		}
 	}
 
-	// Load the durable handoff owner after normal or Wiki-atomic seeding.
-	if enteredFinalizing && willSpawnTemporal {
-		fresh, err := s.knowledgeRepo.GetKnowledgeByID(ctx, payload.TenantID, payload.KnowledgeID)
-		if err != nil { return fmt.Errorf("reload temporal batch owner: %w", err) }
-		knowledge.FinalizingBatchID = fresh.FinalizingBatchID
-	}
+	if enteredFinalizing && willSpawnTemporal { knowledge.FinalizingBatchID = batchID }
 
 	// Queue best-effort automatic tagging only after the processing row has
 	// successfully handed off to finalizing or completed. This avoids model calls from a
