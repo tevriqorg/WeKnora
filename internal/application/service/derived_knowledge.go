@@ -62,6 +62,11 @@ func (s *DerivedKnowledgeEnvelopeService) Upsert(ctx context.Context, kbID strin
 		Channel: derivedKnowledgeChannel, RequestedKnowledgeID: knowledgeID, DerivedMetadata: meta,
 	}
 
+	// Do not advance SourceRevision for an update the manual writer rejects.
+	if _, _, _, err := validateManualKnowledgePayload(payload); err != nil {
+		return nil, fmt.Errorf("validate derived knowledge before source revision: %w", err)
+	}
+
 	existing, getErr := s.knowledge.GetKnowledgeByID(ctx, knowledgeID)
 	if getErr != nil && !errors.Is(getErr, apprepo.ErrKnowledgeNotFound) {
 		return nil, getErr
