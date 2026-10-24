@@ -215,7 +215,6 @@ func TestDerivedRejectedOversizeRevisionKeepsCurrentSource(t *testing.T) {
 	require.Equal(t, originalMeta.SnapshotHash, stored.SnapshotHash)
 }
 
-
 // #126 Codex finding 4365682879: a downstream publication failure after
 // successful preflight must restore the previous current SourceRevision.
 func TestDerivedFailedPublicationRollsBackSourceRevision(t *testing.T) {
