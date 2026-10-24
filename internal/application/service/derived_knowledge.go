@@ -21,6 +21,7 @@ type derivedKnowledgeWriter interface {
 
 type derivedSourceRevisionStore interface {
 	UpsertSourceRevision(context.Context, *types.SourceRevision) (*types.SourceRevision, bool, error)
+	RollbackSourceRevision(context.Context, string, string) error
 }
 
 type DerivedKnowledgeEnvelopeService struct {
@@ -94,19 +95,31 @@ func (s *DerivedKnowledgeEnvelopeService) Upsert(ctx context.Context, kbID strin
 	// Source reality must be durable before publishing work that may reach
 	// Temporal Enrichment. The source-specific revision ID remains the native
 	// version while WeKnora owns its internal monotonic SourceRevision identity.
-	if _, _, err := s.revisions.UpsertSourceRevision(ctx, &types.SourceRevision{
+	revision, revisionCreated, err := s.revisions.UpsertSourceRevision(ctx, &types.SourceRevision{
 		KnowledgeID: existing.ID, NativeVersion: envelope.SourceRevisionID,
 		ObservedAt: envelope.ProducedAt, ResourceRef: envelope.SourceResourceRef,
 		Locator: envelope.SourceKey, Mime: "text/markdown",
-	}); err != nil {
+	})
+	if err != nil {
 		return existing, fmt.Errorf("persist derived source revision: %w", err)
+	}
+	// If the downstream metadata publication fails, restore the previous
+	// current source identity. Rollback failure must remain visible rather
+	// than silently leaving a mismatched CURRENT projection.
+	publicationFailure := func(cause error) (*types.Knowledge, error) {
+		if revisionCreated && revision != nil {
+			if rollbackErr := s.revisions.RollbackSourceRevision(context.WithoutCancel(ctx), existing.ID, revision.RevisionID); rollbackErr != nil {
+				return existing, errors.Join(cause, fmt.Errorf("rollback derived source revision: %w", rollbackErr))
+			}
+		}
+		return existing, cause
 	}
 
 	if meta.AnalysisStatus != "ready" {
 		if !created && (stored.SnapshotHash != meta.SnapshotHash || existing.ParseStatus == types.ParseStatusFailed) {
 			updated, err := s.knowledge.UpdateManualKnowledge(ctx, existing.ID, payload)
 			if err != nil {
-				return existing, fmt.Errorf("refresh derived knowledge draft: %w", err)
+				return publicationFailure(fmt.Errorf("refresh derived knowledge draft: %w", err))
 			}
 			return updated, nil
 		}
@@ -119,7 +132,7 @@ func (s *DerivedKnowledgeEnvelopeService) Upsert(ctx context.Context, kbID strin
 	payload.Status = types.ManualKnowledgeStatusPublish
 	updated, err := s.knowledge.UpdateManualKnowledge(ctx, existing.ID, payload)
 	if err != nil {
-		return existing, fmt.Errorf("publish derived knowledge: %w", err)
+		return publicationFailure(fmt.Errorf("publish derived knowledge: %w", err))
 	}
 	return updated, nil
 }

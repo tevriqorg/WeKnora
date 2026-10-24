@@ -60,18 +60,38 @@ func (f *derivedWriterFixture) UpdateManualKnowledge(_ context.Context, id strin
 }
 
 type derivedRevisionFixture struct {
-	calls int
-	last  *types.SourceRevision
+	calls     int
+	last      *types.SourceRevision
+	history   []*types.SourceRevision
+	rollbacks int
 }
 
 func (f *derivedRevisionFixture) UpsertSourceRevision(_ context.Context, r *types.SourceRevision) (*types.SourceRevision, bool, error) {
 	f.calls++
 	copy := *r
-	if copy.RevisionID == "" {
-		copy.RevisionID = "internal-rev"
+	created := f.last == nil || f.last.NativeVersion != copy.NativeVersion
+	if created {
+		copy.RevisionID = "internal-rev-" + copy.NativeVersion
+		f.history = append(f.history, &copy)
+	} else {
+		copy.RevisionID = f.last.RevisionID
+		f.history[len(f.history)-1] = &copy
 	}
 	f.last = &copy
-	return &copy, f.calls == 1, nil
+	return &copy, created, nil
+}
+
+func (f *derivedRevisionFixture) RollbackSourceRevision(_ context.Context, knowledgeID, revisionID string) error {
+	if f.last == nil || f.last.RevisionID != revisionID || f.last.KnowledgeID != knowledgeID {
+		return errors.New("cannot rollback superseded revision")
+	}
+	f.rollbacks++
+	f.history = f.history[:len(f.history)-1]
+	f.last = nil
+	if len(f.history) != 0 {
+		f.last = f.history[len(f.history)-1]
+	}
+	return nil
 }
 
 func derivedEnvelope(status string) *types.DerivedKnowledgeEnvelope {
@@ -215,4 +235,5 @@ func TestDerivedFailedPublicationRollsBackSourceRevision(t *testing.T) {
 	require.ErrorContains(t, err, "injected downstream publish failure")
 	require.Equal(t, "rev-1", revisions.last.NativeVersion,
 		"failed publish must not leave v2 as current source reality")
+	require.Equal(t, 1, revisions.rollbacks, "publication failure must invoke durable rollback")
 }
