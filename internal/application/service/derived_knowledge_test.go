@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -161,4 +162,30 @@ func TestDerivedDistinctSourcesDoNotAliasSameRevision(t *testing.T) {
 	second, err := svc.Upsert(ctx, "kb-1", other)
 	require.NoError(t, err)
 	require.NotEqual(t, first.ID, second.ID, "distinct sources with identical revision labels were merged")
+}
+
+// #126 Codex finding 4365682879: a rejected revision must not replace the
+// currently published source reality (or enqueue an update for stale chunks).
+func TestDerivedRejectedOversizeRevisionKeepsCurrentSource(t *testing.T) {
+    writer := newDerivedWriterFixture()
+    revisions := &derivedRevisionFixture{}
+    svc := newDerivedKnowledgeEnvelopeService(writer, revisions)
+    ctx := types.WithExecutionTenant(context.Background(), 7)
+    original, err := svc.Upsert(ctx, "kb-1", derivedEnvelope("ready"))
+    require.NoError(t, err)
+    originalMeta, err := original.DerivedMetadata()
+    require.NoError(t, err)
+    require.Equal(t, "rev-1", revisions.last.NativeVersion)
+
+    rejected := derivedEnvelope("ready")
+    rejected.SourceRevisionID = "rev-2"
+    rejected.Markdown = strings.Repeat("x", manualContentMaxLength+1)
+    _, err = svc.Upsert(ctx, "kb-1", rejected)
+    require.Error(t, err, "oversize update must be rejected")
+    require.Equal(t, 1, revisions.calls, "rejected revision must not become current")
+    require.Equal(t, "rev-1", revisions.last.NativeVersion)
+    require.Equal(t, 1, writer.updates, "rejected revision must not publish")
+    stored, err := writer.rows[original.ID].DerivedMetadata()
+    require.NoError(t, err)
+    require.Equal(t, originalMeta.SnapshotHash, stored.SnapshotHash)
 }
