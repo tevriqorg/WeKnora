@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ type derivedWriterFixture struct {
 	rows             map[string]*types.Knowledge
 	creates, updates int
 	lastPayload      *types.ManualKnowledgePayload
+	updateErr        error
 }
 
 func newDerivedWriterFixture() *derivedWriterFixture {
@@ -42,6 +44,9 @@ func (f *derivedWriterFixture) CreateKnowledgeFromManual(_ context.Context, kbID
 }
 func (f *derivedWriterFixture) UpdateManualKnowledge(_ context.Context, id string, p *types.ManualKnowledgePayload) (*types.Knowledge, error) {
 	f.updates++
+	if f.updateErr != nil {
+		return nil, f.updateErr
+	}
 	f.lastPayload = p
 	k := f.rows[id]
 	_ = k.SetManualMetadata(types.NewManualKnowledgeMetadata(p.Content, p.Status, 2))
@@ -188,4 +193,26 @@ func TestDerivedRejectedOversizeRevisionKeepsCurrentSource(t *testing.T) {
 	stored, err := writer.rows[original.ID].DerivedMetadata()
 	require.NoError(t, err)
 	require.Equal(t, originalMeta.SnapshotHash, stored.SnapshotHash)
+}
+
+
+// #126 Codex finding 4365682879: a downstream publication failure after
+// successful preflight must restore the previous current SourceRevision.
+func TestDerivedFailedPublicationRollsBackSourceRevision(t *testing.T) {
+	writer := newDerivedWriterFixture()
+	revisions := &derivedRevisionFixture{}
+	svc := newDerivedKnowledgeEnvelopeService(writer, revisions)
+	ctx := types.WithExecutionTenant(context.Background(), 7)
+	_, err := svc.Upsert(ctx, "kb-1", derivedEnvelope("ready"))
+	require.NoError(t, err)
+	require.Equal(t, "rev-1", revisions.last.NativeVersion)
+
+	writer.updateErr = errors.New("injected downstream publish failure")
+	failed := derivedEnvelope("ready")
+	failed.SourceRevisionID = "rev-2"
+	failed.Markdown = "new content"
+	_, err = svc.Upsert(ctx, "kb-1", failed)
+	require.ErrorContains(t, err, "injected downstream publish failure")
+	require.Equal(t, "rev-1", revisions.last.NativeVersion,
+		"failed publish must not leave v2 as current source reality")
 }
