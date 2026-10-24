@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS knowledges (
     knowledge_base_id      VARCHAR(64) NOT NULL,
     parse_status           VARCHAR(32) NOT NULL,
     pending_subtasks_count INTEGER NOT NULL DEFAULT 0,
+    finalizing_batch_id VARCHAR(36) NOT NULL DEFAULT '',
     error_message          TEXT,
     processed_at           DATETIME,
     updated_at             DATETIME,

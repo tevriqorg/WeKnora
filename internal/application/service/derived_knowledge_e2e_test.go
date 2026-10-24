@@ -23,7 +23,7 @@ func TestG6DerivedEnvelopeReachesTemporalWithOriginalTimecode(t *testing.T) {
 	fixture.svc.kbService = kbSvc
 	require.NoError(t, fixture.db.AutoMigrate(
 		&types.SourceRevision{}, &types.TemporalGraphGeneration{},
-		&types.TemporalEpisodeBinding{}, &types.TemporalTransitionBinding{},
+		&types.TemporalEpisodeBinding{}, &types.TemporalTransitionBinding{}, &types.TemporalFinalizeReceipt{},
 	))
 	fixture.svc.task = client
 	knowledgeRepo := apprepo.NewKnowledgeRepository(fixture.db)
