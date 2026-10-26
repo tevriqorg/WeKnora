@@ -28,6 +28,7 @@ const (
 // files, and lets either copy be deleted without breaking the other.
 const (
 	ResourceOwnerKnowledge         = "knowledge"
+	ResourceOwnerKnowledgeBase     = "knowledge_base"
 	ResourceOwnerMessage           = "message"
 	ResourceOwnerTemporaryDocument = "temporary_document"
 )
@@ -35,6 +36,7 @@ const (
 // Resource binding relations describe why an owner claims a resource.
 const (
 	ResourceRelationSourceFile     = "source_file"
+	ResourceRelationAIBOXSource    = "aibox_source"
 	ResourceRelationExtractedImage = "extracted_image"
 	ResourceRelationArtifact       = "artifact"
 	ResourceRelationAttachment     = "attachment"

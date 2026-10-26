@@ -736,35 +736,42 @@ func (s *knowledgeService) CreateKnowledgeFromPassageSync(ctx context.Context,
 	return s.createKnowledgeFromPassageInternal(ctx, kbID, passage, true, channel)
 }
 
+// validateManualKnowledgePayload is the shared pre-write contract. Derived
+// envelopes must pass it before changing the durable current SourceRevision.
+func validateManualKnowledgePayload(payload *types.ManualKnowledgePayload) (string, string, string, error) {
+	if payload == nil {
+		return "", "", "", werrors.NewBadRequestError("请求内容不能为空")
+	}
+	cleanContent := secutils.CleanMarkdown(payload.Content)
+	if strings.TrimSpace(cleanContent) == "" {
+		return "", "", "", werrors.NewValidationError("内容不能为空")
+	}
+	if len([]rune(cleanContent)) > manualContentMaxLength {
+		return "", "", "", werrors.NewValidationError(fmt.Sprintf("内容长度超出限制（最多%d个字符）", manualContentMaxLength))
+	}
+	safeTitle, ok := secutils.ValidateInput(payload.Title)
+	if !ok {
+		return "", "", "", werrors.NewValidationError("标题包含非法字符或超出长度限制")
+	}
+	status := strings.ToLower(strings.TrimSpace(payload.Status))
+	if status == "" {
+		status = types.ManualKnowledgeStatusDraft
+	}
+	if status != types.ManualKnowledgeStatusDraft && status != types.ManualKnowledgeStatusPublish {
+		return "", "", "", werrors.NewValidationError("状态仅支持 draft 或 publish")
+	}
+	return cleanContent, safeTitle, status, nil
+}
+
 // CreateKnowledgeFromManual creates or saves manual Markdown knowledge content.
 func (s *knowledgeService) CreateKnowledgeFromManual(ctx context.Context,
 	kbID string, payload *types.ManualKnowledgePayload, channel string,
 ) (*types.Knowledge, error) {
 	logger.Info(ctx, "Start creating manual knowledge entry")
 
-	if payload == nil {
-		return nil, werrors.NewBadRequestError("请求内容不能为空")
-	}
-
-	cleanContent := secutils.CleanMarkdown(payload.Content)
-	if strings.TrimSpace(cleanContent) == "" {
-		return nil, werrors.NewValidationError("内容不能为空")
-	}
-	if len([]rune(cleanContent)) > manualContentMaxLength {
-		return nil, werrors.NewValidationError(fmt.Sprintf("内容长度超出限制（最多%d个字符）", manualContentMaxLength))
-	}
-
-	safeTitle, ok := secutils.ValidateInput(payload.Title)
-	if !ok {
-		return nil, werrors.NewValidationError("标题包含非法字符或超出长度限制")
-	}
-
-	status := strings.ToLower(strings.TrimSpace(payload.Status))
-	if status == "" {
-		status = types.ManualKnowledgeStatusDraft
-	}
-	if status != types.ManualKnowledgeStatusDraft && status != types.ManualKnowledgeStatusPublish {
-		return nil, werrors.NewValidationError("状态仅支持 draft 或 publish")
+	cleanContent, safeTitle, status, err := validateManualKnowledgePayload(payload)
+	if err != nil {
+		return nil, err
 	}
 
 	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, kbID)
@@ -1017,29 +1024,9 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 	knowledgeID string, payload *types.ManualKnowledgePayload,
 ) (*types.Knowledge, error) {
 	logger.Info(ctx, "Start updating manual knowledge entry")
-	if payload == nil {
-		return nil, werrors.NewBadRequestError("请求内容不能为空")
-	}
-
-	cleanContent := secutils.CleanMarkdown(payload.Content)
-	if strings.TrimSpace(cleanContent) == "" {
-		return nil, werrors.NewValidationError("内容不能为空")
-	}
-	if len([]rune(cleanContent)) > manualContentMaxLength {
-		return nil, werrors.NewValidationError(fmt.Sprintf("内容长度超出限制（最多%d个字符）", manualContentMaxLength))
-	}
-
-	safeTitle, ok := secutils.ValidateInput(payload.Title)
-	if !ok {
-		return nil, werrors.NewValidationError("标题包含非法字符或超出长度限制")
-	}
-
-	status := strings.ToLower(strings.TrimSpace(payload.Status))
-	if status == "" {
-		status = types.ManualKnowledgeStatusDraft
-	}
-	if status != types.ManualKnowledgeStatusDraft && status != types.ManualKnowledgeStatusPublish {
-		return nil, werrors.NewValidationError("状态仅支持 draft 或 publish")
+	cleanContent, safeTitle, status, err := validateManualKnowledgePayload(payload)
+	if err != nil {
+		return nil, err
 	}
 
 	existing, kb, err := loadKnowledgeWrite(ctx, s.repo, s.kbService, knowledgeID)
@@ -1135,7 +1122,7 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 				"title": existing.Title, "status": status,
 				"processing_status": "failed", "failure_stage": "enqueue",
 			})
-		return nil, werrors.NewInternalServerError("Failed to submit processing task")
+		return existing, &types.ManualPublicationCommittedError{Err: werrors.NewInternalServerError("Failed to submit processing task")}
 	}
 	recordKBActivity(ctx, s.audit, tenantID, existing.KnowledgeBaseID, types.AuditActionKnowledgeUpdated,
 		"knowledge", existing.ID, types.AuditOutcomeAccepted, map[string]any{
@@ -1149,8 +1136,27 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 	knowledge *types.Knowledge, content string, needCleanup bool, options ...asynq.Option,
 ) (string, error) {
+	manualMeta, err := knowledge.ManualMetadata()
+	if err != nil {
+		return "", fmt.Errorf("read manual metadata before enqueue: %w", err)
+	}
+	if manualMeta == nil || manualMeta.Content != content {
+		return "", fmt.Errorf("manual content changed before enqueue")
+	}
+	derivedMeta, err := knowledge.DerivedMetadata()
+	if err != nil {
+		return "", fmt.Errorf("read derived metadata before enqueue: %w", err)
+	}
+	derivedHash := ""
+	if derivedMeta != nil {
+		if derivedMeta.SnapshotHash == "" {
+			return "", fmt.Errorf("derived snapshot hash missing before enqueue")
+		}
+		derivedHash = derivedMeta.SnapshotHash
+	}
 	requestID, _ := types.RequestIDFromContext(ctx)
 	payload := types.ManualProcessPayload{
+		ManualVersion: manualMeta.Version, DerivedSnapshotHash: derivedHash,
 		RequestId:       requestID,
 		TenantID:        knowledge.TenantID,
 		KnowledgeID:     knowledge.ID,

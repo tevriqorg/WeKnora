@@ -307,8 +307,20 @@ func (s *AIBOXMigrationService) temporalReady(ctx context.Context, k *types.Know
 	if len(windows) == 0 {
 		return true, nil
 	}
+	derived, err := k.DerivedMetadata()
+	if err != nil {
+		return false, err
+	}
+	snapshotHash := ""
+	if derived != nil {
+		snapshotHash = derived.SnapshotHash
+		if snapshotHash == "" {
+			return false, fmt.Errorf("derived migration snapshot hash missing for %s", k.ID)
+		}
+	}
 	for _, w := range windows {
-		episode, err := deterministicTemporalEpisodeUUID(k.ID, rev.RevisionID, g.GenerationID, w.Ordinal)
+		episode, err := deterministicTemporalEpisodeUUIDForSnapshot(
+			k.ID, rev.RevisionID, g.GenerationID, w.Ordinal, snapshotHash)
 		if err != nil {
 			return false, err
 		}
@@ -360,7 +372,19 @@ func (s *AIBOXMigrationService) enqueueTemporalBackfill(ctx context.Context, rep
 				report.BackfillReady++
 				continue
 			}
-			payload, _ := json.Marshal(types.TemporalEnrichmentPayload{TenantID: k.TenantID, KnowledgeBaseID: k.KnowledgeBaseID, KnowledgeID: k.ID})
+			derived, err := k.DerivedMetadata()
+			if err != nil {
+				return err
+			}
+			snapshotHash := ""
+			if derived != nil {
+				snapshotHash = derived.SnapshotHash
+				if snapshotHash == "" {
+					return fmt.Errorf("derived migration snapshot missing for %s", k.ID)
+				}
+			}
+			// Backfill is not an owner of the live parse finalizing counter.
+			payload, _ := json.Marshal(types.TemporalEnrichmentPayload{TenantID: k.TenantID, KnowledgeBaseID: k.KnowledgeBaseID, KnowledgeID: k.ID, SnapshotHash: snapshotHash})
 			task := asynq.NewTask(types.TypeTemporalEnrichment, payload, asynq.Queue(types.QueueTemporal), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
 			_, err = s.task.Enqueue(task, asynq.Unique(30*time.Minute))
 			if errors.Is(err, asynq.ErrDuplicateTask) {

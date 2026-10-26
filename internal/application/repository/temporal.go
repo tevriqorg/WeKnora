@@ -84,6 +84,134 @@ func (r *TemporalRepository) UpsertEpisodeBinding(ctx context.Context, binding *
 	}).Create(binding).Error
 }
 
+// ErrTemporalSnapshotSuperseded indicates that a queued/in-flight extraction
+// no longer owns the Knowledge snapshot. It must not retry writes as current.
+var ErrTemporalSnapshotSuperseded = errors.New("temporal derived snapshot superseded")
+
+// withCurrentDerivedSnapshot serializes each projection write with updates to
+// the Knowledge row. PostgreSQL FOR UPDATE makes the snapshot check and the
+// binding/transition write atomic relative to a new derived publication.
+// The old snapshot can legitimately be published again (rollback), so status
+// alone is not a sufficient fence.
+func (r *TemporalRepository) withCurrentDerivedSnapshot(
+	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash string,
+	write func(*TemporalRepository) error,
+) error {
+	if tenantID == 0 || knowledgeID == "" || snapshotHash == "" {
+		return errors.New("derived temporal write requires tenant, knowledge and snapshot")
+	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var knowledge types.Knowledge
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND tenant_id = ?", knowledgeID, tenantID).
+			First(&knowledge).Error; err != nil {
+			return err
+		}
+		derived, err := knowledge.DerivedMetadata()
+		if err != nil {
+			return err
+		}
+		if derived == nil || derived.SnapshotHash != snapshotHash {
+			return ErrTemporalSnapshotSuperseded
+		}
+		return write(&TemporalRepository{db: tx})
+	})
+}
+
+func (r *TemporalRepository) MarkSupersededEpisodeBindingsForDerivedSnapshot(
+	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash,
+	generationID, revisionID string, keepEpisodeUUIDs []string,
+) error {
+	return r.withCurrentDerivedSnapshot(ctx, tenantID, knowledgeID, snapshotHash, func(txRepo *TemporalRepository) error {
+		return txRepo.MarkSupersededEpisodeBindings(ctx, generationID, knowledgeID, revisionID, keepEpisodeUUIDs)
+	})
+}
+
+func (r *TemporalRepository) UpsertEpisodeBindingForDerivedSnapshot(
+	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash string,
+	binding *types.TemporalEpisodeBinding,
+) error {
+	return r.withCurrentDerivedSnapshot(ctx, tenantID, knowledgeID, snapshotHash, func(txRepo *TemporalRepository) error {
+		return txRepo.UpsertEpisodeBinding(ctx, binding)
+	})
+}
+
+// Commit the adapter receipt and its ready binding together, under the same
+// snapshot fence. A late old worker cannot insert stale transitions and then
+// resurrect its old binding after a newer publication.
+func (r *TemporalRepository) CommitEpisodeForDerivedSnapshot(
+	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash string,
+	binding *types.TemporalEpisodeBinding, transitions []types.TemporalTransitionBinding,
+) error {
+	return r.withCurrentDerivedSnapshot(ctx, tenantID, knowledgeID, snapshotHash, func(txRepo *TemporalRepository) error {
+		if err := txRepo.InsertTransitions(ctx, transitions); err != nil {
+			return err
+		}
+		return txRepo.UpsertEpisodeBinding(ctx, binding)
+	})
+}
+
+// FinalizeSubtaskForSnapshot releases a temporal parse slot only while the
+// task's exact derived snapshot (or native non-derived identity) still owns
+// the Knowledge row. The row lock makes this check and decrement atomic with
+// snapshot publication on PostgreSQL. Legacy derived tasks without a snapshot
+// token fail closed instead of draining a newer run's counter.
+func (r *TemporalRepository) FinalizeSubtaskForSnapshot(
+	ctx context.Context, tenantID uint64, knowledgeID, snapshotHash, batchID string,
+) error {
+	if tenantID == 0 || knowledgeID == "" || batchID == "" {
+		return ErrTemporalSnapshotSuperseded
+	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var knowledge types.Knowledge
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND tenant_id = ?", knowledgeID, tenantID).
+			First(&knowledge).Error; err != nil {
+			return err
+		}
+		if knowledge.ParseStatus != types.ParseStatusFinalizing || knowledge.FinalizingBatchID != batchID {
+			return ErrTemporalSnapshotSuperseded
+		}
+		derived, err := knowledge.DerivedMetadata()
+		if err != nil {
+			return err
+		}
+		if derived != nil {
+			if snapshotHash == "" || derived.SnapshotHash != snapshotHash {
+				return ErrTemporalSnapshotSuperseded
+			}
+		} else if snapshotHash != "" {
+			return ErrTemporalSnapshotSuperseded
+		}
+		receipt := &types.TemporalFinalizeReceipt{BatchID: batchID, SlotKind: "temporal", TenantID: tenantID, KnowledgeID: knowledgeID}
+		insert := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(receipt)
+		if insert.Error != nil { return insert.Error }
+		if insert.RowsAffected == 0 { return nil }
+		_, err = finalizeSubtask(tx, knowledgeID)
+		return err
+	})
+}
+
+// MarkSupersededEpisodeBindings removes old derived projections from the
+// current evidence view before a corrected snapshot is extracted. The raw
+// SourceRevision stays authoritative and is never rewritten by this method.
+// An adapter failure leaves the new projection degraded, not silently stale.
+func (r *TemporalRepository) MarkSupersededEpisodeBindings(ctx context.Context, generationID, knowledgeID, revisionID string, keepEpisodeUUIDs []string) error {
+	if generationID == "" || knowledgeID == "" || revisionID == "" {
+		return errors.New("temporal projection scope is required")
+	}
+	q := r.db.WithContext(ctx).Model(&types.TemporalEpisodeBinding{}).
+		Where("generation_id = ? AND knowledge_id = ? AND source_revision_id = ?", generationID, knowledgeID, revisionID).
+		Where("temporal_status IN ?", []types.TemporalStatus{
+			types.TemporalStatusPending, types.TemporalStatusRunning,
+			types.TemporalStatusReady, types.TemporalStatusFailed,
+		})
+	if len(keepEpisodeUUIDs) > 0 {
+		q = q.Where("episode_uuid NOT IN ?", keepEpisodeUUIDs)
+	}
+	return q.Update("temporal_status", types.TemporalStatusStale).Error
+}
+
 func (r *TemporalRepository) InsertTransitions(ctx context.Context, transitions []types.TemporalTransitionBinding) error {
 	if len(transitions) == 0 {
 		return nil

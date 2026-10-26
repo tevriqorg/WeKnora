@@ -33,6 +33,17 @@ func (s *knowledgeService) stageManualSourceRevision(ctx context.Context, knowle
 	if !ok || knowledge == nil {
 		return nil, false, nil
 	}
+	// Derived text is a projection, not a new raw source. Its native revision
+	// was persisted by DerivedKnowledgeEnvelopeService before publication.
+	// Hashing this Markdown would replace source provenance with "manual:" and
+	// create a false reality revision on every processor refresh.
+	meta, err := knowledge.DerivedMetadata()
+	if err != nil {
+		return nil, false, err
+	}
+	if meta != nil {
+		return nil, false, nil
+	}
 	return store.UpsertSourceRevision(ctx, manualSourceRevisionCandidate(knowledge.ID, content, knowledge.UpdatedAt))
 }
 

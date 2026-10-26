@@ -395,6 +395,9 @@ type TemporalEnrichmentPayload struct {
 	KnowledgeBaseID string `json:"knowledge_base_id"`
 	KnowledgeID     string `json:"knowledge_id"`
 	Attempt         int    `json:"attempt,omitempty"`
+	SnapshotHash    string `json:"snapshot_hash,omitempty"`
+	FinalizingBatchID string `json:"finalizing_batch_id,omitempty"`
+	FinalizesSlot   bool   `json:"finalizes_slot,omitempty"`
 }
 
 type SummaryGenerationPayload struct {
@@ -512,6 +515,8 @@ type ManualProcessPayload struct {
 	KnowledgeBaseID string `json:"knowledge_base_id"`
 	Content         string `json:"content"`      // cleaned markdown content
 	NeedCleanup     bool   `json:"need_cleanup"` // true for update, false for create
+	ManualVersion   int    `json:"manual_version,omitempty"` // version at enqueue time
+	DerivedSnapshotHash string `json:"derived_snapshot_hash,omitempty"` // exact derived projection at enqueue time
 }
 
 // ImageMultimodalPayload represents the image multimodal processing task payload.

@@ -3517,6 +3517,33 @@ func (s *knowledgeService) UpdateImageInfo(
 	return nil
 }
 
+// manualTaskMatchesKnowledge prevents an old queued payload from processing a
+// stable Knowledge ID after a newer manual/derived projection is published.
+// Legacy ordinary manual tasks remain eligible when their persisted content
+// matches; legacy derived tasks without an exact snapshot token fail closed.
+func manualTaskMatchesKnowledge(knowledge *types.Knowledge, payload types.ManualProcessPayload) (bool, error) {
+	manual, err := knowledge.ManualMetadata()
+	if err != nil {
+		return false, err
+	}
+	if manual == nil {
+		return false, fmt.Errorf("manual processing metadata missing")
+	}
+	if manual.Content != payload.Content ||
+		(payload.ManualVersion != 0 && manual.Version != payload.ManualVersion) {
+		return false, nil
+	}
+	derived, err := knowledge.DerivedMetadata()
+	if err != nil {
+		return false, err
+	}
+	if derived != nil {
+		return payload.DerivedSnapshotHash != "" &&
+			payload.DerivedSnapshotHash == derived.SnapshotHash, nil
+	}
+	return payload.DerivedSnapshotHash == "", nil
+}
+
 // ProcessManualUpdate handles Asynq manual knowledge update tasks.
 // It performs cleanup of old indexes/chunks (when NeedCleanup is true) and re-indexes the content.
 func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Task) error {
@@ -3558,6 +3585,20 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 		payload.KnowledgeID); err != nil {
 		return err
 	}
+
+	current, err := manualTaskMatchesKnowledge(knowledge, payload)
+	if err != nil {
+		return fmt.Errorf("check manual queued revision: %w", err)
+	}
+	if !current {
+		logger.Infof(ctx, "ProcessManualUpdate: superseded manual revision, skipping: %s", payload.KnowledgeID)
+		return nil
+	}
+
+	// Bind every synchronous repository save to the revision read above. A
+	// second entry check alone cannot stop an in-flight v1 overwriting v2.
+	ctx, err = types.WithManualWriteFence(ctx, knowledge)
+	if err != nil { return fmt.Errorf("bind manual processing write fence: %w", err) }
 
 	// Skip if already completed or being deleted
 	if knowledge.ParseStatus == types.ParseStatusCompleted {

@@ -192,6 +192,8 @@ type Knowledge struct {
 	// (summary + question + graph chunks). Only meaningful while
 	// ParseStatus == "finalizing"; defaults to 0 in any terminal state.
 	PendingSubtasksCount int `json:"pending_subtasks_count" gorm:"type:int;not null;default:0"`
+	// Fresh per processing-to-finalizing handoff, independent of content hash.
+	FinalizingBatchID string `json:"-" gorm:"type:varchar(36);not null;default:''"`
 	// Summary status for async summary generation
 	SummaryStatus string `json:"summary_status"     gorm:"type:varchar(32);default:none"`
 	// Profile is the structured companion of Description: a one-line gist,

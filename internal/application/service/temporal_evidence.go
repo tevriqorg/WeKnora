@@ -42,6 +42,33 @@ func deterministicTemporalEpisodeUUID(knowledgeID, sourceRevisionID, generationI
 	return uuid.NewSHA1(temporalEpisodeNamespace, []byte(name)).String(), nil
 }
 
+// A derived processor may correct text/locators without creating a new raw
+// SourceRevision. Graphiti treats an existing episode UUID as immutable, so
+// the projection snapshot must be part of the episode identity. Ordinary
+// document UUIDs retain their established identity and retry semantics.
+func deterministicDerivedTemporalEpisodeUUID(knowledgeID, sourceRevisionID, generationID string, ordinal int, snapshotHash string) (string, error) {
+	if strings.TrimSpace(snapshotHash) == "" {
+		return "", fmt.Errorf("derived temporal snapshot hash is required")
+	}
+	if _, err := deterministicTemporalEpisodeUUID(knowledgeID, sourceRevisionID, generationID, ordinal); err != nil {
+		return "", err
+	}
+	name := fmt.Sprintf("knowledge=%s\nrevision=%s\ngeneration=%s\nwindow=%d\nderived_snapshot=%s", knowledgeID, sourceRevisionID, generationID, ordinal, snapshotHash)
+	return uuid.NewSHA1(temporalEpisodeNamespace, []byte(name)).String(), nil
+}
+
+// The migration readiness oracle and the worker must use the same episode
+// identity, including derived processor corrections on an unchanged raw
+// SourceRevision. Empty snapshotHash is reserved for native documents.
+func deterministicTemporalEpisodeUUIDForSnapshot(
+	knowledgeID, sourceRevisionID, generationID string, ordinal int, snapshotHash string,
+) (string, error) {
+	if snapshotHash != "" {
+		return deterministicDerivedTemporalEpisodeUUID(knowledgeID, sourceRevisionID, generationID, ordinal, snapshotHash)
+	}
+	return deterministicTemporalEpisodeUUID(knowledgeID, sourceRevisionID, generationID, ordinal)
+}
+
 func temporalReferenceTime(revision *types.SourceRevision) time.Time {
 	if revision == nil {
 		return time.Time{}

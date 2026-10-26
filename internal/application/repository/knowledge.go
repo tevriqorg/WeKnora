@@ -10,10 +10,13 @@ import (
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var ErrKnowledgeNotFound = errors.New("knowledge not found")
+var ErrManualWriteSuperseded = errors.New("manual processing write superseded")
 
 // likeEscapeChar is the SQL ESCAPE character paired with escapeLikeKeyword.
 const likeEscapeChar = `\`
@@ -41,7 +44,7 @@ func escapeLikeKeyword(keyword string) string {
 // counter jump back up and never reach zero (the "stuck
 // pending_subtasks_count / never promoted to completed" bug). Omitting
 // the column here means Save can never touch it.
-var omitFieldsOnUpdate = []string{"DeletedAt", "PendingSubtasksCount"}
+var omitFieldsOnUpdate = []string{"DeletedAt", "PendingSubtasksCount", "FinalizingBatchID"}
 
 // knowledgeRepository implements knowledge base and knowledge repository interface
 type knowledgeRepository struct {
@@ -361,6 +364,23 @@ func (r *knowledgeRepository) UpdateKnowledge(ctx context.Context, knowledge *ty
 	// to support unrelated updates when the caller did not provide the field.
 	if knowledge.CustomMetadata == nil {
 		omit = append(append([]string{}, omitFieldsOnUpdate...), "custom_metadata")
+	}
+	if fence, ok := types.ManualWriteFenceFromContext(ctx); ok {
+		if knowledge.ID != fence.KnowledgeID || knowledge.TenantID != fence.TenantID || knowledge.KnowledgeBaseID != fence.KBID {
+			return ErrManualWriteSuperseded
+		}
+		return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var current types.Knowledge
+			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND id = ?", fence.TenantID, fence.KnowledgeID).First(&current).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) { return ErrManualWriteSuperseded }
+			if err != nil { return err }
+			if !fence.Matches(&current) || current.ParseStatus == types.ParseStatusCancelled || current.ParseStatus == types.ParseStatusDeleting { return ErrManualWriteSuperseded }
+			// UPDATE only: unlike Save, a vanished row must never be re-created.
+			result := tx.Model(&types.Knowledge{}).Where("tenant_id = ? AND id = ?", fence.TenantID, fence.KnowledgeID).Select("*").Omit(omit...).Updates(knowledge)
+			if result.Error != nil { return result.Error }
+			if result.RowsAffected != 1 { return ErrManualWriteSuperseded }
+			return nil
+		})
 	}
 	err := r.db.WithContext(ctx).Omit(omit...).Save(knowledge).Error
 	return err
@@ -758,6 +778,14 @@ func finalizeSubtask(db *gorm.DB, id string) (bool, error) {
 func (r *knowledgeRepository) SetFinalizing(
 	ctx context.Context, id string, expectedSubtasks int,
 ) (bool, error) {
+	return r.SetFinalizingWithBatch(ctx, id, expectedSubtasks, uuid.NewString())
+}
+
+// SetFinalizingWithBatch persists the caller-selected owner atomically with the counter.
+func (r *knowledgeRepository) SetFinalizingWithBatch(
+	ctx context.Context, id string, expectedSubtasks int, batchID string,
+) (bool, error) {
+	if batchID == "" { return false, errors.New("finalizing batch owner required") }
 	if expectedSubtasks < 0 {
 		expectedSubtasks = 0
 	}
@@ -767,6 +795,7 @@ func (r *knowledgeRepository) SetFinalizing(
 		Updates(map[string]interface{}{
 			"parse_status":           types.ParseStatusFinalizing,
 			"pending_subtasks_count": expectedSubtasks,
+			"finalizing_batch_id": batchID,
 			"error_message":          "",
 			"updated_at":             now,
 		})

@@ -104,3 +104,10 @@ type MessageFileBindingLookup interface {
 		reference, messageID string,
 	) (*types.MessageFileBindings, error)
 }
+
+
+// AIBOXKBSourceLookup proves a source resource was explicitly registered for
+// the target knowledge base. Tenant equality alone is never an authorization.
+type AIBOXKBSourceLookup interface {
+	IsAIBOXSourceRegisteredForKB(ctx context.Context, tenantID uint64, kbID, reference string) (bool, error)
+}

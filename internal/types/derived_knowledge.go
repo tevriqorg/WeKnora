@@ -90,6 +90,15 @@ func DerivedKnowledgeID(tenantID uint64, kbID, idempotencyKey string) string {
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(name)).String()
 }
 
+// DerivedSourceKnowledgeID identifies the logical source projection, independently
+// of revision fingerprints, processing versions, and retry idempotency keys.
+// Legacy revision-based IDs are deliberately not rewritten by ingestion.
+func DerivedSourceKnowledgeID(tenantID uint64, kbID, sourceKey, derivedObjectID string) string {
+	identity, _ := json.Marshal([]string{kbID, sourceKey, derivedObjectID})
+	name := fmt.Sprintf("urn:tevriq:aibox:derived-source:v1\ntenant=%d\nidentity=%s", tenantID, identity)
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(name)).String()
+}
+
 func (e *DerivedKnowledgeEnvelope) NormalizeAndValidate() error {
 	if e == nil {
 		return errors.New("derived envelope is required")

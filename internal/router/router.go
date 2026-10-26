@@ -293,6 +293,9 @@ func NewRouter(params RouterParams) *gin.Engine {
 			params.KnowledgeService,
 		)
 		RegisterKnowledgeTagRoutes(v1, params.TagHandler, rbacGuards)
+		if params.KnowledgeHandler != nil {
+			params.KnowledgeHandler.SetAIBOXResourceCatalog(params.ResourceCatalog)
+		}
 		RegisterKnowledgeRoutes(v1, params.KnowledgeHandler, rbacGuards)
 		RegisterFAQRoutes(v1, params.FAQHandler, rbacGuards)
 		RegisterChunkRoutes(v1, params.ChunkHandler, rbacGuards)

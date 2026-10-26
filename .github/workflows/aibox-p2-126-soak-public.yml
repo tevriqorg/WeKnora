@@ -1,0 +1,40 @@
+name: AIBOX P2 126 Soak Harness (public isolated)
+on:
+  pull_request:
+    branches: [aibox-0.8-uat-20261017]
+    paths:
+      - '.github/workflows/aibox-p2-126-soak-public.yml'
+      - 'tests/aibox_p2_126_soak_snapshot/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  preflight-soak-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Verify isolated test and negative oracle gates
+        run: |
+          set -euo pipefail
+          cd tests/aibox_p2_126_soak_snapshot
+          python3 -m unittest discover -s tests/g1 -p 'test_soak_*.py' -v
+      - name: Verify no unapproved run can enter SOAK
+        run: |
+          set -euo pipefail
+          cd tests/aibox_p2_126_soak_snapshot
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          python3 deploy/aibox-0.8/vela-uat/soak/ops_readiness.py --state-dir "$d" > "$RUNNER_TEMP/p2-readiness.json"
+          python3 - "$RUNNER_TEMP/p2-readiness.json" <<'PY'
+          import json,sys
+          d=json.load(open(sys.argv[1]))
+          assert not d['trial_running']
+          assert not d['gate0_ready']
+          assert d['baseline_case_count']==35
+          assert d['components']['durable_agent_repair_handoff'].startswith('BLOCKED')
+          print('Safeguard: Gate 0 blocked until real integration + independent review')
+          PY
