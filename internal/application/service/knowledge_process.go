@@ -3595,6 +3595,11 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 		return nil
 	}
 
+	// Bind every synchronous repository save to the revision read above. A
+	// second entry check alone cannot stop an in-flight v1 overwriting v2.
+	ctx, err = types.WithManualWriteFence(ctx, knowledge)
+	if err != nil { return fmt.Errorf("bind manual processing write fence: %w", err) }
+
 	// Skip if already completed or being deleted
 	if knowledge.ParseStatus == types.ParseStatusCompleted {
 		logger.Infof(ctx, "ProcessManualUpdate: already completed, skipping: %s", payload.KnowledgeID)
