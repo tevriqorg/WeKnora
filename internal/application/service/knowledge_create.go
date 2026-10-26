@@ -1122,7 +1122,7 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 				"title": existing.Title, "status": status,
 				"processing_status": "failed", "failure_stage": "enqueue",
 			})
-		return nil, werrors.NewInternalServerError("Failed to submit processing task")
+		return existing, &types.ManualPublicationCommittedError{Err: werrors.NewInternalServerError("Failed to submit processing task")}
 	}
 	recordKBActivity(ctx, s.audit, tenantID, existing.KnowledgeBaseID, types.AuditActionKnowledgeUpdated,
 		"knowledge", existing.ID, types.AuditOutcomeAccepted, map[string]any{

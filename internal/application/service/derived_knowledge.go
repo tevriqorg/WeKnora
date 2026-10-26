@@ -107,6 +107,11 @@ func (s *DerivedKnowledgeEnvelopeService) Upsert(ctx context.Context, kbID strin
 	// current source identity. Rollback failure must remain visible rather
 	// than silently leaving a mismatched CURRENT projection.
 	publicationFailure := func(cause error) (*types.Knowledge, error) {
+		var committed *types.ManualPublicationCommittedError
+		if errors.As(cause, &committed) {
+			// Metadata is already durable; rolling back source identity corrupts provenance.
+			return existing, cause
+		}
 		if revisionCreated && revision != nil {
 			if rollbackErr := s.revisions.RollbackSourceRevision(context.WithoutCancel(ctx), existing.ID, revision.RevisionID); rollbackErr != nil {
 				return existing, errors.Join(cause, fmt.Errorf("rollback derived source revision: %w", rollbackErr))
