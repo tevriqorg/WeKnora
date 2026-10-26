@@ -172,3 +172,25 @@ func TestDerivedRevisionUpdatePersistsHistoryOnStableKnowledge(t *testing.T) {
 	require.NoError(t, fixture.db.Model(&types.SourceRevision{}).Where("knowledge_id = ?", originalID).Count(&count).Error)
 	require.EqualValues(t, 2, count, "processor replay must not create a reality revision")
 }
+
+// A queue error occurs after metadata commits; it must not undo the raw revision.
+func TestDerivedPostCommitQueueFailurePreservesCurrentSourceRevision(t *testing.T) {
+ mini := miniredis.RunT(t)
+ client := asynq.NewClient(asynq.RedisClientOpt{Addr: mini.Addr()})
+ fixture := newDocumentWriteFixture(t)
+ fixture.svc.kbService = &g2OrdinaryDocKBService{kb: fixture.kbs.values["kb"]}
+ require.NoError(t, fixture.db.AutoMigrate(&types.SourceRevision{}))
+ fixture.svc.task = client
+ repo := apprepo.NewKnowledgeRepository(fixture.db); fixture.svc.repo = repo
+ revisions, ok := any(repo).(derivedSourceRevisionStore);require.True(t,ok)
+ svc := newDerivedKnowledgeEnvelopeService(fixture.svc,revisions)
+ first,err:=svc.Upsert(fixture.ctx,"kb",derivedEnvelope("ready"));require.NoError(t,err)
+ require.NoError(t,client.Close()) // Real queue transport failure, not a writer spy.
+ next:=derivedEnvelope("ready");next.SourceRevisionID="rev-2";next.Markdown="v2 committed before queue failure"
+ _,err=svc.Upsert(fixture.ctx,"kb",next);require.Error(t,err)
+ stored,err:=repo.GetKnowledgeByID(fixture.ctx,first.TenantID,first.ID);require.NoError(t,err)
+ meta,err:=stored.DerivedMetadata();require.NoError(t,err);require.Equal(t,"rev-2",meta.SourceRevisionID)
+ var current types.SourceRevision
+ require.NoError(t,fixture.db.Where("knowledge_id = ? AND is_current = ?",first.ID,true).First(&current).Error)
+ require.Equal(t,"rev-2",current.NativeVersion,"queue failure after committed v2 metadata must not restore v1 source")
+}
